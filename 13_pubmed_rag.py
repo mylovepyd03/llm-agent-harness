@@ -21,7 +21,9 @@ load_dotenv()
 
 OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
 OLLAMA_EMBED_URL = "http://localhost:11434/api/embeddings"
-CHAT_MODEL = "llama3.2"
+CHAT_MODEL = "llama3.2"  # 메인 에이전트 모델(도구 선택 등)은 그대로 유지
+TRANSLATE_MODEL = "llama3.1"  # 번역 전용 - llama3.2:3b는 영→한 번역 시 문자가 섞이는 문제가 있어서 8B로 교체
+SYNTHESIZE_MODEL = "llama3.1"  # 종합(최종답변) 단계도 llama3.2:3b가 근거 없는 내용을 지어내서 테스트 삼아 8B로 교체
 EMBED_MODEL = "bge-m3"
 
 DISEASE_API_URL = "http://apis.data.go.kr/B551182/diseaseInfoService1/getDissNameCodeList1"
@@ -189,14 +191,14 @@ def build_context(articles: list[dict], chars_per_abstract: int = 700) -> str:
     return "\n\n".join(blocks)
 
 
-def chat(messages) -> dict:
+def chat(messages, model: str = CHAT_MODEL) -> dict:
     payload = {
-        "model": CHAT_MODEL,
+        "model": model,
         "messages": messages,
         "stream": False,
         "options": {"temperature": 0, "num_predict": 512},
     }
-    response = requests.post(OLLAMA_CHAT_URL, json=payload, timeout=120)
+    response = requests.post(OLLAMA_CHAT_URL, json=payload, timeout=180)
     response.raise_for_status()
     return response.json()["message"]
 
@@ -216,13 +218,29 @@ def has_sentence_repetition(content: str, min_len: int = 15, min_repeats: int = 
     return any(count >= min_repeats for count in counts.values())
 
 
-# CJK 통합 한자 영역(U+4E00~U+9FFF) - 영→한 번역 시 "두통" 대신 "头痛"처럼
-# 한자가 섞여 나오는 고장이 반복 관찰돼서, 이게 하나라도 섞이면 실패로 본다.
-CJK_IDEOGRAPH_PATTERN = re.compile(r"[一-鿿]")
+# 영→한 번역 중에 낯선 문자 체계가 섞여 나오는 고장을 반복 관찰함
+# (한자 "头痛", 키릴 문자 "міг라인" 등 - 매번 다른 문자셋으로 샘).
+# 특정 문자셋 하나씩 막는 대신, "한국어 답변에 있을 법한 문자만 허용"하는
+# 화이트리스트 방식으로 일반화 - 07_interactive_agent.py의 도구 인자 검증과 같은 패턴.
+# 허용: 한글 음절/자모, 기본 라틴+라틴 확장(영문/숫자/약물기호), 일반 구두점, 공백.
+_ALLOWED_SCRIPT_RANGES = (
+    (0xAC00, 0xD7A3),  # 한글 음절
+    (0x3131, 0x318E),  # 한글 자모
+    (0x0000, 0x024F),  # 기본 라틴 + 라틴 확장 (영문자/숫자/기본 기호)
+    (0x2000, 0x206F),  # 일반 구두점 (따옴표, 줄임표, 대시 등)
+)
 
 
-def has_cjk_leak(content: str) -> bool:
-    return CJK_IDEOGRAPH_PATTERN.search(content) is not None
+def has_unexpected_script(content: str) -> bool:
+    """허용 범위 밖의 문자(한자, 키릴 문자 등)가 하나라도 섞이면 True."""
+    for ch in content:
+        if ch.isspace():
+            continue
+        code = ord(ch)
+        if any(lo <= code <= hi for lo, hi in _ALLOWED_SCRIPT_RANGES):
+            continue
+        return True
+    return False
 
 
 def is_generation_ok(content: str) -> bool:
@@ -232,14 +250,14 @@ def is_generation_ok(content: str) -> bool:
         return False
     if has_sentence_repetition(content):
         return False
-    if has_cjk_leak(content):
+    if has_unexpected_script(content):
         return False
     return True
 
 
-def call_with_retry(messages, max_retries: int = 1):
+def call_with_retry(messages, max_retries: int = 1, model: str = CHAT_MODEL):
     for attempt in range(max_retries + 1):
-        message = chat(messages)
+        message = chat(messages, model=model)
         if is_generation_ok(message.get("content", "")):
             return message
         print(f"[경고] 비정상 응답 감지 (시도 {attempt + 1}/{max_retries + 1}) - 재시도")
@@ -247,7 +265,8 @@ def call_with_retry(messages, max_retries: int = 1):
 
 
 def translate_abstract(article: dict) -> str | None:
-    """1단계: 초록 하나만 한국어로 충실하게 번역/정리 (종합·해석은 아직 안 함)."""
+    """1단계: 초록 하나만 한국어로 충실하게 번역/정리 (종합·해석은 아직 안 함).
+    번역은 llama3.2:3b가 약한 작업이라 더 큰 TRANSLATE_MODEL을 씀."""
     messages = [
         {"role": "system", "content": TRANSLATE_SYSTEM_PROMPT},
         {
@@ -255,7 +274,7 @@ def translate_abstract(article: dict) -> str | None:
             "content": f"제목: {article['title']}\n초록: {article['abstract'][:1500]}",
         },
     ]
-    message = call_with_retry(messages)
+    message = call_with_retry(messages, model=TRANSLATE_MODEL)
     if message is None:
         return None
     return message["content"]
@@ -304,7 +323,7 @@ def answer_with_pubmed_rag(keyword: str) -> str:
         },
     ]
 
-    message = call_with_retry(messages)
+    message = call_with_retry(messages, model=SYNTHESIZE_MODEL)
     if message is None:
         return "[오류] 모델이 계속 비정상적인 응답을 내서 포기했습니다."
     return message["content"]
