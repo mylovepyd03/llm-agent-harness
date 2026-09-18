@@ -409,6 +409,15 @@ PUBMED_SYNTHESIZE_SYSTEM_PROMPT = (
     "이것은 진단이 아니라 연구 요약이므로 단정적으로 말하지 마세요.\n"
     "질문 문장을 그대로 되풀이하지 말고, 바로 본론(답)부터 말하세요."
 )
+PUBMED_SIMPLIFY_SYSTEM_PROMPT = (
+    "당신은 의학 연구 요약을 일반인이 이해하기 쉽게 다시 설명하는 도우미입니다.\n"
+    "아래 [원문]의 사실 내용은 절대 바꾸거나 빼거나 새로 추가하지 마세요 - 새로운 "
+    "정보, 수치, 연도, 논문을 지어내지 마세요. 오직 표현만 쉽게 바꾸는 것이 목표입니다.\n"
+    "어려운 의학 용어나 줄임말이 나오면 쉬운 말로 풀어 쓰거나, 용어 뒤에 괄호로 "
+    "짧은 설명을 덧붙이세요 (예: '기관지 과민성(기관지가 자극에 예민하게 반응하는 상태)').\n"
+    "원문에 있는 문장/정보량을 크게 늘리거나 줄이지 말고, 있는 내용을 더 쉬운 말로 "
+    "바꾸는 데만 집중하세요."
+)
 
 
 def _has_fabricated_citation(content: str, valid_years: set[str]) -> bool:
@@ -416,6 +425,31 @@ def _has_fabricated_citation(content: str, valid_years: set[str]) -> bool:
     형식만 그럴듯한(예: "대한당뇨병학회 (2018)") 지어낸 인용일 가능성이 높다고 본다."""
     years_mentioned = set(re.findall(r"\b(?:19|20)\d{2}\b", content))
     return bool(years_mentioned - valid_years)
+
+
+def _simplify_for_layperson(content: str, valid_years: set[str]) -> str:
+    """전문용어 위주 답변을 일반인이 이해하기 쉽게 다시 설명한다. 새 사실을
+    지어낼 위험이 있으므로, 실패/의심스러우면 원문(전문용어 버전)을 그대로 반환해서
+    안전을 우선한다 - 이해하기 쉬운 것보다 정확한 게 더 중요."""
+    messages = [
+        {"role": "system", "content": PUBMED_SIMPLIFY_SYSTEM_PROMPT},
+        {"role": "user", "content": f"[원문]\n{content}"},
+    ]
+    for attempt in range(2):
+        message = call_with_retry(messages, model=RAG_MODEL, inner=True, num_predict=1024)
+        if message is None:
+            print("    [경고] 쉬운 설명 생성 실패 - 원문 그대로 사용")
+            return content
+        simplified = message["content"]
+        if _has_fabricated_citation(simplified, valid_years):
+            print(f"    [경고] 쉬운 설명 중 없는 연도 인용 감지 - 재시도 ({attempt + 1}/2)")
+            continue
+        if len(simplified) > len(content) * 1.8:
+            print(f"    [경고] 쉬운 설명이 원문보다 훨씬 길어짐(내용 추가 의심) - 재시도 ({attempt + 1}/2)")
+            continue
+        return simplified
+    print("    [경고] 쉬운 설명이 계속 의심스러워 원문 그대로 사용")
+    return content
 
 
 def _translate_abstract(article: dict) -> str | None:
@@ -469,7 +503,7 @@ def search_pubmed_deep(keyword: str) -> str:
         if message is None:
             return "[오류] 모델이 계속 비정상적인 응답을 내서 포기했습니다."
         if not _has_fabricated_citation(message["content"], valid_years):
-            return message["content"]
+            return _simplify_for_layperson(message["content"], valid_years)
         print(f"    [경고] 실제 논문에 없는 연도 인용 감지 - 재시도 ({attempt + 1}/2)")
     return "논문 내용을 실제 자료 그대로 요약하지 못해 답변할 수 없습니다. 다시 시도해주세요."
 
