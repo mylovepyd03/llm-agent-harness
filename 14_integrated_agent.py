@@ -289,13 +289,31 @@ def search_kdca(query: str, top_k: int = 5):
 
 
 SYMPTOM_RAG_SYSTEM_PROMPT = (
-    "당신은 국가건강정보포털 자료를 바탕으로 답하는 건강정보 도우미입니다.\n"
+    "당신은 국가건강정보포털 자료를 바탕으로 답하는 친절한 건강정보 도우미입니다.\n"
     "반드시 아래 [참고자료]에 있는 내용만 근거로 답하세요.\n"
     "참고자료에 없는 내용은 절대 지어내지 말고, 모른다고 답하세요.\n"
     "이것은 진단이 아니라 참고 정보이므로, 확정적으로 단언하지 말고 "
     "'~일 가능성이 있습니다' 같은 표현을 쓰고, 증상이 지속되면 병원 진료를 권하세요.\n"
-    "질문 문장을 그대로 되풀이하지 말고, 바로 본론(답)부터 말하세요."
+    "질문 문장을 그대로 되풀이하지 말고, 바로 본론(답)부터 말하세요.\n"
+    "따뜻하고 공감하는 어투로, 참고자료에 있는 원인/증상/관리방법을 충분히 풀어서 "
+    "친절하게 설명하세요. 한두 문장으로 짧게 끝내지 마세요.\n"
+    "답변 끝에는 진단을 좁히는 데 도움될 후속 질문을 하나 자연스럽게 덧붙이세요 "
+    "(예: '~한 증상도 있으신가요?'). 참고자료에 실제로 나오는 증상/요인에 대해서만 "
+    "물어보세요."
 )
+
+
+def truncate_at_sentence(text: str, max_chars: int) -> str:
+    """max_chars 근처에서 자르되, 문장 중간이 아니라 그 문장이 끝나는 지점까지 포함한다.
+    글자 수 제한보다 "문장을 안 끊는 것"이 우선이라, max_chars를 조금 넘어가도 된다
+    (그냥 글자 수로 자르면 문장이 중간에 뚝 끊기고, 그 잘린 문장을 LLM이 그대로
+    베껴 써서 답변도 중간에 끊기는 문제가 실제로 발생했음)."""
+    if len(text) <= max_chars:
+        return text
+    for i in range(max_chars, len(text)):
+        if text[i] in ".!?":
+            return text[: i + 1]
+    return text  # 그 뒤로 문장부호가 아예 없으면 끝까지 다 포함
 
 
 def search_symptom_info(symptom_or_keyword: str) -> str:
@@ -305,12 +323,15 @@ def search_symptom_info(symptom_or_keyword: str) -> str:
         return "관련된 건강정보를 찾지 못해 답변할 수 없습니다. 증상을 좀 더 구체적으로 말씀해주세요."
 
     print("    [검색됨]", ", ".join(f"{n}({s:.2f})" for n, s, _ in results[:3]))
-    context = "\n\n".join(f"[{name}]\n{entry['text'][:500]}" for name, score, entry in results[:3])
+    context = "\n\n".join(
+        f"[{name}]\n{truncate_at_sentence(entry['text'], 800)}" for name, score, entry in results[:3]
+    )
     messages = [
         {"role": "system", "content": SYMPTOM_RAG_SYSTEM_PROMPT},
         {"role": "user", "content": f"[참고자료]\n{context}\n\n[질문]\n{symptom_or_keyword}"},
     ]
-    message = call_with_retry(messages, model=AGENT_MODEL, inner=True)
+    # 종합(합성) 단계는 llama3.2가 약함 - PubMed 때와 같은 이유로 RAG_MODEL(llama3.1) 사용
+    message = call_with_retry(messages, model=RAG_MODEL, inner=True)
     if message is None:
         return "[오류] 모델이 계속 비정상적인 응답을 내서 포기했습니다."
     return message["content"]
@@ -492,6 +513,9 @@ class MedicalConversationState:
         self.symptoms: list[dict] = []       # [{"text": ..., "turn": n}]
         self.turn = 0
         self.last_topic: str | None = None   # 가장 최근에 다룬 주제 - "그럼", "그거" 같은 지칭어 해결용
+        self.awaiting_followup_reply = False  # 직전 답변이 후속 질문으로 끝났으면 True -
+                                               # 다음 입력이 "네", "심해요"처럼 지칭어 없는
+                                               # 짧은 대답이어도 이전 주제를 이어받게 함
 
     def record_disease(self, name: str, source: str):
         """같은 질환이 또 언급되면 새 항목을 만들지 않고, 기존 항목의 횟수/최근턴/출처만 갱신."""
@@ -604,7 +628,12 @@ def resolve_query_with_context(user_question: str, state: MedicalConversationSta
     known_term = find_known_term_in_text(user_question)
     if known_term:
         return user_question, known_term
-    is_followup = any(marker in user_question for marker in FOLLOWUP_MARKERS)
+    # 지칭어("그럼"/"그거")가 있거나, 직전 답변이 후속 질문으로 끝나서 지금이
+    # 그 답인 경우(예: "네", "심해요")에는 지칭어가 없어도 이전 주제를 이어받는다.
+    is_followup = (
+        any(marker in user_question for marker in FOLLOWUP_MARKERS)
+        or state.awaiting_followup_reply
+    )
     if state.last_topic and is_followup:
         implied_term = state.last_topic if state.last_topic in KDCA_CORPUS else None
         return f"{state.last_topic} {user_question}", implied_term
@@ -665,6 +694,10 @@ def run_agent_turn(messages: list, user_question: str, state: MedicalConversatio
 
     state.last_topic = known_term or user_question
     combined = "\n\n".join(parts)
+    # 이번 답변이 후속 질문으로 끝났으면, 다음 입력이 "네"/"심해요"처럼 지칭어가
+    # 없어도 이전 주제를 이어받게 표시해둔다 (마지막 200자만 검사 - 너무 앞부분의
+    # 물음표까지 "질문으로 끝났다"고 오판하지 않도록).
+    state.awaiting_followup_reply = "?" in combined[-200:]
     messages.append({"role": "assistant", "content": combined})
     return combined
 
