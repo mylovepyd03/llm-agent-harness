@@ -411,6 +411,13 @@ PUBMED_SYNTHESIZE_SYSTEM_PROMPT = (
 )
 
 
+def _has_fabricated_citation(content: str, valid_years: set[str]) -> bool:
+    """답변에 등장하는 4자리 연도가 실제로 검색된 논문 연도 목록에 하나도 없으면,
+    형식만 그럴듯한(예: "대한당뇨병학회 (2018)") 지어낸 인용일 가능성이 높다고 본다."""
+    years_mentioned = set(re.findall(r"\b(?:19|20)\d{2}\b", content))
+    return bool(years_mentioned - valid_years)
+
+
 def _translate_abstract(article: dict) -> str | None:
     messages = [
         {"role": "system", "content": PUBMED_TRANSLATE_SYSTEM_PROMPT},
@@ -452,14 +459,19 @@ def search_pubmed_deep(keyword: str) -> str:
         return "논문 요약을 만들지 못해 답변할 수 없습니다."
 
     context = "\n\n".join(blocks)
+    valid_years = {art["year"] for art in top_articles if art.get("year")}
     messages = [
         {"role": "system", "content": PUBMED_SYNTHESIZE_SYSTEM_PROMPT},
         {"role": "user", "content": f"[참고 요약]\n{context}\n\n[질문]\n{keyword}에 대한 최신 연구 결과를 알려줘."},
     ]
-    message = call_with_retry(messages, model=RAG_MODEL, inner=True, num_predict=1024)
-    if message is None:
-        return "[오류] 모델이 계속 비정상적인 응답을 내서 포기했습니다."
-    return message["content"]
+    for attempt in range(2):
+        message = call_with_retry(messages, model=RAG_MODEL, inner=True, num_predict=1024)
+        if message is None:
+            return "[오류] 모델이 계속 비정상적인 응답을 내서 포기했습니다."
+        if not _has_fabricated_citation(message["content"], valid_years):
+            return message["content"]
+        print(f"    [경고] 실제 논문에 없는 연도 인용 감지 - 재시도 ({attempt + 1}/2)")
+    return "논문 내용을 실제 자료 그대로 요약하지 못해 답변할 수 없습니다. 다시 시도해주세요."
 
 
 # ---------------------------------------------------------------------------
