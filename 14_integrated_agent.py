@@ -695,14 +695,23 @@ def run_agent_turn(messages: list, user_question: str, state: MedicalConversatio
         if known_term:
             state.record_disease(known_term, "search_wikipedia(fallback)")
         else:
-            state.record_symptom(user_question, "search_wikipedia(fallback)")
+            # 위키피디아 결과 형식 "[위키피디아 - 제목]\n..."에서 실제 문서 제목을
+            # 뽑아 기록 (위와 같은 이유로 질문 원문 대신 실제 매칭된 이름을 씀)
+            title_match = re.match(r"\[위키피디아 - (.+?)\]", wiki_result)
+            if title_match:
+                state.record_disease(title_match.group(1), "search_wikipedia(fallback)")
     else:
         print("  [파이프라인] 건강포털 RAG 성공")
         parts.append(rag_result)
         if known_term:
             state.record_disease(known_term, "search_symptom_info")
         else:
-            state.record_symptom(user_question, "search_symptom_info")
+            # 정확한 병명이 없으면, 사용자 질문 원문("위염이 뭐야?", "그럼 치료법은?")을
+            # 그대로 "증상"에 넣는 대신, 검색으로 실제 매칭된 질환명을 기록한다 -
+            # 질문 문장 자체가 증상 목록에 지저분하게 쌓이는 문제가 있었음.
+            top_match = search_kdca(search_text, top_k=1)
+            if top_match:
+                state.record_disease(top_match[0][0], "search_symptom_info")
 
     # 3) 정확한 병명을 알면 공식 코드도 같이
     if known_term:
