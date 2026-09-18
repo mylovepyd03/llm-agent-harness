@@ -64,12 +64,12 @@ with open(KDCA_EMBEDDINGS_PATH, encoding="utf-8") as f:
 # 공통: LLM 호출 + 두 겹의 검증(하네스)
 # ---------------------------------------------------------------------------
 
-def chat(messages, tools=None, model: str = AGENT_MODEL, temperature: float = 0) -> dict:
+def chat(messages, tools=None, model: str = AGENT_MODEL, temperature: float = 0, num_predict: int = 512) -> dict:
     payload = {
         "model": model,
         "messages": messages,
         "stream": False,
-        "options": {"temperature": temperature, "num_predict": 512},
+        "options": {"temperature": temperature, "num_predict": num_predict},
     }
     if tools:
         payload["tools"] = tools
@@ -189,7 +189,7 @@ def is_rag_generation_ok(content: str) -> bool:
     return True
 
 
-def call_with_retry(messages, tools=None, model: str = AGENT_MODEL, max_retries: int = 1, inner: bool = False):
+def call_with_retry(messages, tools=None, model: str = AGENT_MODEL, max_retries: int = 1, inner: bool = False, num_predict: int = 512):
     """1차 시도는 temperature=0(일관성), 실패하면 재시도부터는 temperature를
     올려서(0.6) 다른 출력이 나올 여지를 준다. temperature=0은 같은 입력에 거의
     항상 같은(고장난) 출력을 내서, 아무것도 안 바꾸고 재시도해봐야 소용없다는
@@ -198,7 +198,7 @@ def call_with_retry(messages, tools=None, model: str = AGENT_MODEL, max_retries:
     checker = is_rag_generation_ok if inner else is_outer_response_ok
     for attempt in range(max_retries + 1):
         temperature = 0 if attempt == 0 else 0.6
-        message = chat(messages, tools=tools, model=model, temperature=temperature)
+        message = chat(messages, tools=tools, model=model, temperature=temperature, num_predict=num_predict)
         ok = checker(message.get("content", "")) if inner else checker(message)
         if ok:
             return message
@@ -330,8 +330,10 @@ def search_symptom_info(symptom_or_keyword: str) -> str:
         {"role": "system", "content": SYMPTOM_RAG_SYSTEM_PROMPT},
         {"role": "user", "content": f"[참고자료]\n{context}\n\n[질문]\n{symptom_or_keyword}"},
     ]
-    # 종합(합성) 단계는 llama3.2가 약함 - PubMed 때와 같은 이유로 RAG_MODEL(llama3.1) 사용
-    message = call_with_retry(messages, model=RAG_MODEL, inner=True)
+    # 종합(합성) 단계는 llama3.2가 약함 - PubMed 때와 같은 이유로 RAG_MODEL(llama3.1) 사용.
+    # num_predict: 친절하고 상세하게 답하도록 프롬프트를 늘렸더니 512토큰 한도에
+    # 걸려 문장이 뚝 끊기는 경우가 실제로 발생해서 넉넉하게 늘림.
+    message = call_with_retry(messages, model=RAG_MODEL, inner=True, num_predict=1024)
     if message is None:
         return "[오류] 모델이 계속 비정상적인 응답을 내서 포기했습니다."
     return message["content"]
@@ -445,7 +447,7 @@ def search_pubmed_deep(keyword: str) -> str:
         {"role": "system", "content": PUBMED_SYNTHESIZE_SYSTEM_PROMPT},
         {"role": "user", "content": f"[참고 요약]\n{context}\n\n[질문]\n{keyword}에 대한 최신 연구 결과를 알려줘."},
     ]
-    message = call_with_retry(messages, model=RAG_MODEL, inner=True)
+    message = call_with_retry(messages, model=RAG_MODEL, inner=True, num_predict=1024)
     if message is None:
         return "[오류] 모델이 계속 비정상적인 응답을 내서 포기했습니다."
     return message["content"]
