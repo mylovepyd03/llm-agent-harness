@@ -93,7 +93,10 @@ def has_short_chunk_repetition(content: str) -> bool:
     return re.search(r"(.{2,20}?)\1{4,}", content) is not None
 
 
-def has_sentence_repetition(content: str, min_len: int = 15, min_repeats: int = 3) -> bool:
+def has_sentence_repetition(content: str, min_len: int = 15, min_repeats: int = 2) -> bool:
+    # min_repeats=3이었을 때, "치료" 항목과 "예방" 항목에 완전히 똑같은 문장이
+    # 정확히 2번(예: 금연 설명)만 반복되는 걸 놓친 사례를 실제로 발견함 -
+    # 기존 정상 답변 6개로 오탐 검사한 뒤 2로 낮춰도 안전한 것을 확인함.
     sentences = re.split(r"(?<=[.!?])\s+", content)
     counts: dict[str, int] = {}
     for sentence in sentences:
@@ -292,6 +295,8 @@ SYMPTOM_RAG_SYSTEM_PROMPT = (
     "당신은 국가건강정보포털 자료를 바탕으로 답하는 친절한 건강정보 도우미입니다.\n"
     "반드시 아래 [참고자료]에 있는 내용만 근거로 답하세요.\n"
     "참고자료에 없는 내용은 절대 지어내지 말고, 모른다고 답하세요.\n"
+    "구체적인 약물 이름(예: 특정 성분명, 제품명)을 절대 나열하거나 지어내지 마세요. "
+    "약물치료가 필요하면 '약물치료' 정도로만 일반적으로 언급하세요.\n"
     "이것은 진단이 아니라 참고 정보이므로, 확정적으로 단언하지 말고 "
     "'~일 가능성이 있습니다' 같은 표현을 쓰고, 증상이 지속되면 병원 진료를 권하세요.\n"
     "질문 문장을 그대로 되풀이하지 말고, 바로 본론(답)부터 말하세요.\n"
@@ -316,8 +321,12 @@ def truncate_at_sentence(text: str, max_chars: int) -> str:
     return text  # 그 뒤로 문장부호가 아예 없으면 끝까지 다 포함
 
 
-def search_symptom_info(symptom_or_keyword: str) -> str:
-    """증상 문장이나 병명을 자유롭게 받아서, 관련 질환을 의미 기반으로 찾아 답한다."""
+def search_symptom_info(symptom_or_keyword: str, question_text: str | None = None) -> str:
+    """증상 문장이나 병명을 자유롭게 받아서, 관련 질환을 의미 기반으로 찾아 답한다.
+    search_text(=symptom_or_keyword)는 검색(임베딩 매칭) 전용이고, question_text는
+    LLM에게 보여줄 [질문] 부분 전용이다 - 분리하는 이유는 아래 참고."""
+    question_text = question_text or symptom_or_keyword
+
     results = search_kdca(symptom_or_keyword, top_k=5)
     if not results or results[0][1] < MIN_SIMILARITY_SYMPTOM:
         return "관련된 건강정보를 찾지 못해 답변할 수 없습니다. 증상을 좀 더 구체적으로 말씀해주세요."
@@ -328,7 +337,7 @@ def search_symptom_info(symptom_or_keyword: str) -> str:
     )
     messages = [
         {"role": "system", "content": SYMPTOM_RAG_SYSTEM_PROMPT},
-        {"role": "user", "content": f"[참고자료]\n{context}\n\n[질문]\n{symptom_or_keyword}"},
+        {"role": "user", "content": f"[참고자료]\n{context}\n\n[질문]\n{question_text}"},
     ]
     # 종합(합성) 단계는 llama3.2가 약함 - PubMed 때와 같은 이유로 RAG_MODEL(llama3.1) 사용.
     # num_predict: 친절하고 상세하게 답하도록 프롬프트를 늘렸더니 512토큰 한도에
@@ -622,24 +631,39 @@ def wants_research(user_question: str) -> bool:
 # 버그가 실제로 발생함 - 지칭어가 있을 때만 좁혀서 적용.
 FOLLOWUP_MARKERS = ("그럼", "그거", "그건", "그게", "그것", "이거", "저거")
 
+# "네 심해요"처럼 짧은 대답은 마커도 없고, awaiting_followup_reply도(모델이 항상
+# "?"로 안 끝내서) 못 잡는 경우가 실제로 발생함. 순수 임베딩 점수로 구분해보려 했으나
+# "네 심해요"(0.46)와 "그럼 치료법은?"(0.59)이 둘 다 그 자체로도 그럴듯하게 매칭돼서
+# 점수만으론 구분 불가 - 대신 "짧은 문장인가"를 추가 신호로 씀 (실제 증상 질문은
+# 이보다 길게 나오는 경향이 있어서 안전한 경계로 확인함).
+SHORT_REPLY_MAX_CHARS = 8
+
 
 def resolve_query_with_context(user_question: str, state: MedicalConversationState):
     """이번 질문에서 병명을 직접 찾고, 지칭어(그럼/그거 등)가 있을 때만
-    state.last_topic을 힌트로 앞에 붙인다. LLM 없이 순수 문자열 처리로
-    '그럼 치료법은?' 같은 질문이 이전 주제를 잃지 않게 한다."""
+    state.last_topic을 힌트로 활용한다. LLM 없이 순수 문자열 처리로
+    '그럼 치료법은?' 같은 질문이 이전 주제를 잃지 않게 한다.
+
+    검색용 텍스트(search_text)와 LLM에게 보여줄 질문(question_text)을 분리해서
+    반환한다 - 후속 대답("네 심해요")을 검색어에까지 섞어버리면, "심해요" 같은
+    말이 임베딩을 엉뚱한 문서(예: 응급 기도폐쇄 처치)로 끌고 가는 걸 실제로
+    확인했음. 검색은 이전 주제 하나로만 안전하게 하고, 그 대답 내용은 LLM한테
+    질문으로만 보여줘서 답변에 반영되게 한다.
+
+    반환값: (search_text, question_text, known_term)"""
     known_term = find_known_term_in_text(user_question)
     if known_term:
-        return user_question, known_term
-    # 지칭어("그럼"/"그거")가 있거나, 직전 답변이 후속 질문으로 끝나서 지금이
-    # 그 답인 경우(예: "네", "심해요")에는 지칭어가 없어도 이전 주제를 이어받는다.
+        return user_question, user_question, known_term
     is_followup = (
         any(marker in user_question for marker in FOLLOWUP_MARKERS)
         or state.awaiting_followup_reply
+        or len(user_question.strip()) <= SHORT_REPLY_MAX_CHARS
     )
     if state.last_topic and is_followup:
         implied_term = state.last_topic if state.last_topic in KDCA_CORPUS else None
-        return f"{state.last_topic} {user_question}", implied_term
-    return user_question, None
+        combined_question = f"{state.last_topic} {user_question}"
+        return state.last_topic, combined_question, implied_term
+    return user_question, user_question, None
 
 
 def _is_failure_message(text: str) -> bool:
@@ -652,11 +676,11 @@ def run_agent_turn(messages: list, user_question: str, state: MedicalConversatio
     state.turn += 1
     messages.append({"role": "user", "content": user_question})
 
-    rag_query, known_term = resolve_query_with_context(user_question, state)
+    search_text, question_text, known_term = resolve_query_with_context(user_question, state)
     parts: list[str] = []
 
-    # 1) 건강포털 RAG 먼저 시도
-    rag_result = search_symptom_info(rag_query)
+    # 1) 건강포털 RAG 먼저 시도 (검색은 search_text로, LLM 질문은 question_text로 - 분리 이유는 resolve_query_with_context 참고)
+    rag_result = search_symptom_info(search_text, question_text)
     if _is_failure_message(rag_result):
         # 2) 실패하면 위키피디아로 대체 (아까 "위염"처럼 KDCA에 내용이 비어있는 경우 등)
         print("  [파이프라인] 건강포털 RAG 실패 -> 위키피디아로 대체")
