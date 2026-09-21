@@ -1,3 +1,4 @@
 .env
 __pycache__/
 *.pyc
+data/pubmed_debug_log.jsonl

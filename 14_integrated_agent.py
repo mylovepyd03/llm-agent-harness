@@ -19,6 +19,7 @@ import os
 import re
 import ssl
 import xml.etree.ElementTree as ET
+from datetime import datetime
 
 import requests
 from dotenv import load_dotenv
@@ -41,6 +42,8 @@ DISEASE_API_KEY = os.environ.get("DISEASE_INFO_SERVICE_KEY")
 
 KDCA_EMBEDDINGS_PATH = os.path.join(os.path.dirname(__file__), "data", "kdca_embeddings_clean.json")
 MIN_SIMILARITY_SYMPTOM = 0.45
+
+PUBMED_DEBUG_LOG_PATH = os.path.join(os.path.dirname(__file__), "data", "pubmed_debug_log.jsonl")
 
 PUBMED_ESEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 PUBMED_EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
@@ -420,6 +423,23 @@ PUBMED_SIMPLIFY_SYSTEM_PROMPT = (
 )
 
 
+def _log_pubmed_stage(stage: str, keyword: str, content: str) -> None:
+    """PubMed 답변 생성 단계별 원문을 파일에 상시 남긴다. "동맥경화"처럼 무관한
+    내용이 섞이는 현상이 재발했을 때, 그 순간 터미널을 보고 있지 않았어도 이
+    로그를 대조해서 어느 단계(synthesize/simplify)에서 처음 생겼는지 바로
+    확인하기 위한 것 - 원인 확정에 실패했던 이전 시도 때문에 추가함."""
+    try:
+        with open(PUBMED_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "keyword": keyword,
+                "stage": stage,
+                "content": content,
+            }, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
 def _has_fabricated_citation(content: str, valid_years: set[str]) -> bool:
     """답변에 등장하는 4자리 연도가 실제로 검색된 논문 연도 목록에 하나도 없으면,
     형식만 그럴듯한(예: "대한당뇨병학회 (2018)") 지어낸 인용일 가능성이 높다고 본다."""
@@ -427,7 +447,7 @@ def _has_fabricated_citation(content: str, valid_years: set[str]) -> bool:
     return bool(years_mentioned - valid_years)
 
 
-def _simplify_for_layperson(content: str, valid_years: set[str]) -> str:
+def _simplify_for_layperson(content: str, valid_years: set[str], keyword: str = "") -> str:
     """전문용어 위주 답변을 일반인이 이해하기 쉽게 다시 설명한다. 새 사실을
     지어낼 위험이 있으므로, 실패/의심스러우면 원문(전문용어 버전)을 그대로 반환해서
     안전을 우선한다 - 이해하기 쉬운 것보다 정확한 게 더 중요."""
@@ -441,6 +461,7 @@ def _simplify_for_layperson(content: str, valid_years: set[str]) -> str:
             print("    [경고] 쉬운 설명 생성 실패 - 원문 그대로 사용")
             return content
         simplified = message["content"]
+        _log_pubmed_stage(f"simplify_attempt_{attempt + 1}", keyword, simplified)
         if _has_fabricated_citation(simplified, valid_years):
             print(f"    [경고] 쉬운 설명 중 없는 연도 인용 감지 - 재시도 ({attempt + 1}/2)")
             continue
@@ -480,6 +501,9 @@ def search_pubmed_deep(keyword: str) -> str:
         return f"'{keyword}'({english_query})에 대한 관련 논문을 찾지 못해 답변할 수 없습니다."
 
     print("    [검색됨]", ", ".join(f"{a['title'][:30]}...({a['score']:.2f})" for a in top_articles))
+    _log_pubmed_stage("search_articles", keyword, "\n\n".join(
+        f"[{a['title']}] ({a['journal']}, {a['year']})\n{a['abstract']}" for a in top_articles
+    ))
 
     blocks = []
     for art in top_articles:
@@ -488,6 +512,7 @@ def search_pubmed_deep(keyword: str) -> str:
         print(f"    [번역 {status}] {art['title'][:30]}...")
         if ko:
             blocks.append(f"[{art['title']}] ({art['journal']}, {art['year']})\n{ko}")
+            _log_pubmed_stage(f"translate:{art['title'][:50]}", keyword, ko)
 
     if not blocks:
         return "논문 요약을 만들지 못해 답변할 수 없습니다."
@@ -502,8 +527,9 @@ def search_pubmed_deep(keyword: str) -> str:
         message = call_with_retry(messages, model=RAG_MODEL, inner=True, num_predict=1024)
         if message is None:
             return "[오류] 모델이 계속 비정상적인 응답을 내서 포기했습니다."
+        _log_pubmed_stage(f"synthesize_attempt_{attempt + 1}", keyword, message["content"])
         if not _has_fabricated_citation(message["content"], valid_years):
-            return _simplify_for_layperson(message["content"], valid_years)
+            return _simplify_for_layperson(message["content"], valid_years, keyword)
         print(f"    [경고] 실제 논문에 없는 연도 인용 감지 - 재시도 ({attempt + 1}/2)")
     return "논문 내용을 실제 자료 그대로 요약하지 못해 답변할 수 없습니다. 다시 시도해주세요."
 
@@ -718,60 +744,89 @@ def _is_failure_message(text: str) -> bool:
 
 def run_agent_turn(messages: list, user_question: str, state: MedicalConversationState) -> str:
     """C단계: messages(대화 원문)와 state(구조화된 요약)를 둘 다 세션 내내 이어받는다.
-    도구 선택은 LLM이 아니라 고정된 파이프라인 순서로 결정한다."""
+    도구 선택은 LLM이 아니라 고정된 파이프라인 순서로 결정한다.
+
+    네트워크/Ollama 호출은 전부 이 함수 안에서(직접 또는 하위 도구 함수를 통해)
+    일어나는데, 그중 하나라도 실패하면(Ollama 재시작 중, 외부 API 순단 등)
+    requests 예외가 여기까지 그대로 올라온다. 그걸 여기서 잡아서 messages/state를
+    이번 턴 이전 상태로 되돌리고 친절한 오류 메시지로 답해야, 그 예외가 main()의
+    대화 루프 전체를 죽여서 지금까지의 멀티턴 기록을 날리는 걸 막을 수 있다."""
     state.turn += 1
     messages.append({"role": "user", "content": user_question})
 
-    search_text, question_text, known_term = resolve_query_with_context(user_question, state)
-    parts: list[str] = []
+    try:
+        search_text, question_text, known_term = resolve_query_with_context(user_question, state)
+        parts: list[str] = []
 
-    # 1) 건강포털 RAG 먼저 시도 (검색은 search_text로, LLM 질문은 question_text로 - 분리 이유는 resolve_query_with_context 참고)
-    rag_result = search_symptom_info(search_text, question_text)
-    if _is_failure_message(rag_result):
-        # 2) 실패하면 위키피디아로 대체 (아까 "위염"처럼 KDCA에 내용이 비어있는 경우 등)
-        print("  [파이프라인] 건강포털 RAG 실패 -> 위키피디아로 대체")
-        wiki_result = search_wikipedia(known_term or user_question)
-        if _is_failure_message(wiki_result):
-            return (
-                "이 질문은 제가 다루는 건강/의료 정보 범위를 벗어났거나, "
-                "제가 아는 정보로는 답변하기 어려운 내용인 것 같아요. "
-                "증상이나 병명을 조금 더 구체적으로 말씀해주시겠어요?"
-            )
-        parts.append(wiki_result)
-        if known_term:
-            state.record_disease(known_term, "search_wikipedia(fallback)")
+        # 1) 건강포털 RAG 먼저 시도 (검색은 search_text로, LLM 질문은 question_text로 - 분리 이유는 resolve_query_with_context 참고)
+        rag_result = search_symptom_info(search_text, question_text)
+        if _is_failure_message(rag_result):
+            # 2) 실패하면 위키피디아로 대체 (아까 "위염"처럼 KDCA에 내용이 비어있는 경우 등)
+            print("  [파이프라인] 건강포털 RAG 실패 -> 위키피디아로 대체")
+            wiki_result = search_wikipedia(known_term or user_question)
+            if _is_failure_message(wiki_result):
+                messages.pop()
+                state.turn -= 1
+                return (
+                    "이 질문은 제가 다루는 건강/의료 정보 범위를 벗어났거나, "
+                    "제가 아는 정보로는 답변하기 어려운 내용인 것 같아요. "
+                    "증상이나 병명을 조금 더 구체적으로 말씀해주시겠어요?"
+                )
+            parts.append(wiki_result)
+            if known_term:
+                state.record_disease(known_term, "search_wikipedia(fallback)")
+            else:
+                # 위키피디아 결과 형식 "[위키피디아 - 제목]\n..."에서 실제 문서 제목을
+                # 뽑아 기록. 정확한 병명이 아니라 사용자의 증상 서술로 여기까지 왔으므로,
+                # 서술 자체는 "증상"으로, 매칭된 병명은 "추정 질환"으로 같이 남긴다 -
+                # 여러 턴에 걸쳐 증상이 쌓이고 같은 질환이 후보로 반복되면 문진처럼
+                # 좁혀지는 걸 state.summary()에서 볼 수 있게 하기 위함.
+                title_match = re.match(r"\[위키피디아 - (.+?)\]", wiki_result)
+                if title_match:
+                    matched_name = title_match.group(1)
+                    state.record_symptom(user_question, f"search_wikipedia(fallback, 추정: {matched_name})")
+                    state.record_disease(matched_name, "search_wikipedia(fallback, 증상 매칭 추정)")
         else:
-            # 위키피디아 결과 형식 "[위키피디아 - 제목]\n..."에서 실제 문서 제목을
-            # 뽑아 기록 (위와 같은 이유로 질문 원문 대신 실제 매칭된 이름을 씀)
-            title_match = re.match(r"\[위키피디아 - (.+?)\]", wiki_result)
-            if title_match:
-                state.record_disease(title_match.group(1), "search_wikipedia(fallback)")
-    else:
-        print("  [파이프라인] 건강포털 RAG 성공")
-        parts.append(rag_result)
+            print("  [파이프라인] 건강포털 RAG 성공")
+            parts.append(rag_result)
+            if known_term:
+                state.record_disease(known_term, "search_symptom_info")
+            else:
+                # 정확한 병명을 직접 말한 게 아니라 증상을 서술해서 의미 검색으로
+                # 매칭된 경우다. 사용자가 실제로 한 말(증상 서술)은 "증상"으로,
+                # 검색이 찾아낸 가장 비슷한 병명은 "추정 질환"으로 따로 기록한다 -
+                # 매칭된 병명만 확정 진단처럼 남기면 오해의 소지가 있고, 서술 자체를
+                # 버리면 "증상을 묻고 꼬리를 물어 문진한다"는 기능 자체가 안 남는다.
+                top_match = search_kdca(search_text, top_k=1)
+                if top_match:
+                    matched_name = top_match[0][0]
+                    state.record_symptom(user_question, f"search_symptom_info(추정: {matched_name})")
+                    state.record_disease(matched_name, "search_symptom_info(증상 매칭 추정)")
+
+        # 3) 정확한 병명을 알면 공식 코드도 같이
         if known_term:
-            state.record_disease(known_term, "search_symptom_info")
-        else:
-            # 정확한 병명이 없으면, 사용자 질문 원문("위염이 뭐야?", "그럼 치료법은?")을
-            # 그대로 "증상"에 넣는 대신, 검색으로 실제 매칭된 질환명을 기록한다 -
-            # 질문 문장 자체가 증상 목록에 지저분하게 쌓이는 문제가 있었음.
-            top_match = search_kdca(search_text, top_k=1)
-            if top_match:
-                state.record_disease(top_match[0][0], "search_symptom_info")
+            code_result = search_disease_code(known_term)
+            if not _is_failure_message(code_result):
+                parts.append(code_result)
+                state.record_disease(known_term, "search_disease_code")
 
-    # 3) 정확한 병명을 알면 공식 코드도 같이
-    if known_term:
-        code_result = search_disease_code(known_term)
-        if not _is_failure_message(code_result):
-            parts.append(code_result)
-            state.record_disease(known_term, "search_disease_code")
-
-    # 4) "논문"/"연구" 같은 표현이 있으면 PubMed 추가 (정확한 병명이 있을 때만 - 검색어가 필요해서)
-    if known_term and wants_research(user_question):
-        print("  [파이프라인] '논문/연구' 표현 감지 -> PubMed 추가")
-        pubmed_result = search_pubmed_deep(known_term)
-        parts.append(pubmed_result)
-        state.record_disease(known_term, "search_pubmed_deep")
+        # 4) "논문"/"연구" 같은 표현이 있으면 PubMed 추가 (정확한 병명이 있을 때만 - 검색어가 필요해서)
+        if known_term and wants_research(user_question):
+            print("  [파이프라인] '논문/연구' 표현 감지 -> PubMed 추가")
+            pubmed_result = search_pubmed_deep(known_term)
+            parts.append(pubmed_result)
+            state.record_disease(known_term, "search_pubmed_deep")
+    except requests.exceptions.RequestException as e:
+        # 이번 턴에서 건드린 것(방금 넣은 user 메시지, turn 증가)을 되돌려서,
+        # 다음 질문이 "실패한 턴"의 영향을 받지 않고 깨끗하게 이어지도록 한다.
+        messages.pop()
+        state.turn -= 1
+        print(f"  [오류] 외부 서비스 호출 실패: {type(e).__name__}: {e}")
+        return (
+            "지금 Ollama나 외부 정보 서비스(위키피디아/KDCA/PubMed) 중 하나에 연결하지 "
+            "못했습니다. 인터넷 연결과 Ollama 실행 상태(`ollama serve`)를 확인하고 "
+            "다시 질문해주세요."
+        )
 
     state.last_topic = known_term or user_question
     combined = "\n\n".join(parts)
@@ -808,7 +863,14 @@ def main():
         if "요약" in question or "기록" in question:
             print(f"\n[지금까지의 기록]\n{state.summary()}")
             continue
-        print(f"\n답변> {run_agent_turn(messages, question, state)}")
+        try:
+            print(f"\n답변> {run_agent_turn(messages, question, state)}")
+        except Exception as e:
+            # run_agent_turn 안에서 이미 requests 예외는 잡아서 롤백까지 하지만,
+            # 예상 못 한 다른 버그(예: 코드 오류)까지 여기서 한 번 더 막아서
+            # 세션 전체(지금까지의 멀티턴 기록)가 죽는 것만은 방지한다.
+            print(f"  [오류] 예상치 못한 문제: {type(e).__name__}: {e}")
+            print("답변> 죄송해요, 방금 질문 처리 중 문제가 생겼어요. 다시 한번 질문해주시겠어요?")
 
 
 if __name__ == "__main__":
