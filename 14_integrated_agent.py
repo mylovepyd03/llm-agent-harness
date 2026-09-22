@@ -10,8 +10,11 @@ search_pubmed(제목만 보고 짐작)를 RAG 버전으로 교체한다:
 완성해서 돌려준다. 그런데 이걸 바깥쪽 에이전트(1차 LLM 호출)에게 다시 넘겨서
 "이 결과 보고 답변 써줘"라고 하면, 바깥쪽 LLM이 또 한 번 재해석하면서
 할루시네이션이 재발할 위험이 있다 (실제로 13단계에서 이 문제를 겪었음).
-그래서 RAG 도구가 호출되면, 그 결과를 바깥쪽 LLM에게 넘기지 않고
-**그대로 최종 답변으로 반환**한다 (DIRECT_ANSWER_TOOLS).
+그래서 도구 결과는 바깥쪽 LLM에게 넘기지 않고 **그대로 최종 답변으로 반환**한다.
+
+(C단계에서 더 나아가서, 이제는 "어떤 도구를 쓸지"도 LLM이 아니라 코드가 고정
+순서로 정한다 - run_agent_turn() 참고. LLM은 PubMed 번역/종합/재설명처럼
+"검색된 근거를 문장으로 만드는" 좁은 역할만 맡는다.)
 """
 import json
 import math
@@ -30,8 +33,8 @@ load_dotenv()
 OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
 OLLAMA_EMBED_URL = "http://localhost:11434/api/embeddings"
 
-AGENT_MODEL = "llama3.2"       # 메인 에이전트(도구 선택, 일반 도구 결과 요약)
-RAG_MODEL = "llama3.1"         # RAG 내부 번역/종합 전용 (llama3.2는 이 작업에서 문자 오염 문제 있었음)
+RAG_MODEL = "llama3.1"         # 유일한 채팅 모델 - 번역/종합/재설명 전용
+                                # (llama3.2는 도구 선택 불안정 + 문자 오염 문제가 있어 완전히 은퇴시킴)
 EMBED_MODEL = "bge-m3"
 
 WIKI_HEADERS = {
@@ -64,32 +67,19 @@ with open(KDCA_EMBEDDINGS_PATH, encoding="utf-8") as f:
 
 
 # ---------------------------------------------------------------------------
-# 공통: LLM 호출 + 두 겹의 검증(하네스)
+# 공통: LLM 호출 + 응답 검증(하네스)
 # ---------------------------------------------------------------------------
 
-def chat(messages, tools=None, model: str = AGENT_MODEL, temperature: float = 0, num_predict: int = 512) -> dict:
+def chat(messages, model: str = RAG_MODEL, temperature: float = 0, num_predict: int = 512) -> dict:
     payload = {
         "model": model,
         "messages": messages,
         "stream": False,
         "options": {"temperature": temperature, "num_predict": num_predict},
     }
-    if tools:
-        payload["tools"] = tools
     response = requests.post(OLLAMA_CHAT_URL, json=payload, timeout=180)
     response.raise_for_status()
     return response.json()["message"]
-
-
-# 도구 인자로 허용할 문자 (07단계와 동일)
-ALLOWED_QUERY_CHARS = re.compile(r"^[가-힣a-zA-Z0-9\s\-.,()/%+·]*$")
-
-
-def is_valid_tool_query(text: str) -> bool:
-    text = text.strip()
-    if not text:
-        return False
-    return ALLOWED_QUERY_CHARS.match(text) is not None
 
 
 def has_short_chunk_repetition(content: str) -> bool:
@@ -125,63 +115,6 @@ def has_unexpected_script(content: str) -> bool:
     return False
 
 
-# 가짜 도구 호출(텍스트로 JSON 흉내) 감지 - 모델이 만드는 JSON이 항상 깔끔하진
-# 않아서(예: "parameters\":  처럼 필드명 뒤에 엉뚱한 백슬래시가 낌), 정확한
-# 문자열 일치 대신 "백슬래시가 몇 개 껴도 통과하는" 정규식으로 느슨하게 잡는다.
-_FAKE_TOOL_NAME_RE = re.compile(r'"name"\\*\s*:')
-_FAKE_TOOL_PARAMS_RE = re.compile(r'"(parameters|arguments)\\*"')
-
-
-def has_fake_tool_call_text(content: str) -> bool:
-    stripped = content.strip()
-    name_like = _FAKE_TOOL_NAME_RE.search(content) is not None
-    if not name_like:
-        return False
-    # 중괄호로 시작하면서 "name" 필드가 보이면, parameters/arguments 여부와
-    # 상관없이 이미 자연어 답변이 아니라 JSON을 흉내내려던 것으로 본다.
-    if stripped.startswith("{"):
-        return True
-    return _FAKE_TOOL_PARAMS_RE.search(content) is not None
-
-
-# 의미 검증: "문법은 맞는데 뜻이 없는 한글"(예: "국구괭가하")은 문자 화이트리스트로는
-# 못 잡는다. KDCA 611개 질환 임베딩과 비교해서 "의료 도메인과 조금이라도 관련 있는
-# 내용인가"를 추가로 검사한다. 임계값 0.5는 실측으로 정함:
-#   실제 병명/증상 문장 유사도: 0.569~0.731
-#   헛소리/무관한 문장 유사도: 0.296~0.483
-# 그 사이(약 0.48~0.57)에 뚜렷한 간격이 있어서 0.5로 잡으면 둘을 안전하게 가른다.
-def is_query_semantically_valid(query: str, threshold: float = 0.5) -> bool:
-    query_vec = embed(query)
-    best_score = max(cosine_similarity(query_vec, e["embedding"]) for e in KDCA_CORPUS.values())
-    return best_score >= threshold
-
-
-def is_outer_response_ok(message: dict) -> bool:
-    """1차(에이전트) 응답 검증: 도구 호출이면 인자까지(문법+의미), 아니면 반복/가짜호출/문자오염 체크."""
-    tool_calls = message.get("tool_calls")
-    if tool_calls:
-        for call in tool_calls:
-            args = call.get("function", {}).get("arguments", {})
-            for value in args.values():
-                if not isinstance(value, str):
-                    continue
-                if not is_valid_tool_query(value):
-                    return False
-                if not is_query_semantically_valid(value):
-                    return False
-        return True
-
-    content = message.get("content", "")
-    if not content:
-        return False
-    return not (
-        has_fake_tool_call_text(content)
-        or has_short_chunk_repetition(content)
-        or has_sentence_repetition(content)
-        or has_unexpected_script(content)
-    )
-
-
 def is_rag_generation_ok(content: str) -> bool:
     """RAG 내부 생성(번역/종합) 검증: 반복 + 낯선 문자 섞임 체크."""
     if not content:
@@ -195,18 +128,20 @@ def is_rag_generation_ok(content: str) -> bool:
     return True
 
 
-def call_with_retry(messages, tools=None, model: str = AGENT_MODEL, max_retries: int = 1, inner: bool = False, num_predict: int = 512):
+def call_with_retry(messages, model: str = RAG_MODEL, max_retries: int = 1, num_predict: int = 512):
     """1차 시도는 temperature=0(일관성), 실패하면 재시도부터는 temperature를
     올려서(0.6) 다른 출력이 나올 여지를 준다. temperature=0은 같은 입력에 거의
     항상 같은(고장난) 출력을 내서, 아무것도 안 바꾸고 재시도해봐야 소용없다는
     걸 실제로 확인했음 - 단, 온도를 올리면 새로운 형태로 깨질 수도 있어서
-    재시도 결과도 반드시 같은 검증기를 다시 통과해야만 받아들인다."""
-    checker = is_rag_generation_ok if inner else is_outer_response_ok
+    재시도 결과도 반드시 같은 검증기를 다시 통과해야만 받아들인다.
+
+    (예전엔 여기서 "도구 선택" 응답과 "RAG 내부 생성" 응답을 다른 검증기로 나눠
+    검사했는데, 도구 선택 자체가 결정론적 파이프라인으로 바뀌면서 이 함수가
+    RAG 내부 생성 검증에만 쓰이게 됨 - is_rag_generation_ok 하나로 통일함.)"""
     for attempt in range(max_retries + 1):
         temperature = 0 if attempt == 0 else 0.6
-        message = chat(messages, tools=tools, model=model, temperature=temperature, num_predict=num_predict)
-        ok = checker(message.get("content", "")) if inner else checker(message)
-        if ok:
+        message = chat(messages, model=model, temperature=temperature, num_predict=num_predict)
+        if is_rag_generation_ok(message.get("content", "")):
             return message
         print(f"    [경고] 비정상 응답 감지 (시도 {attempt + 1}/{max_retries + 1}, temp={temperature}) - 재시도")
     return None
@@ -345,7 +280,7 @@ def search_symptom_info(symptom_or_keyword: str, question_text: str | None = Non
     # 종합(합성) 단계는 llama3.2가 약함 - PubMed 때와 같은 이유로 RAG_MODEL(llama3.1) 사용.
     # num_predict: 친절하고 상세하게 답하도록 프롬프트를 늘렸더니 512토큰 한도에
     # 걸려 문장이 뚝 끊기는 경우가 실제로 발생해서 넉넉하게 늘림.
-    message = call_with_retry(messages, model=RAG_MODEL, inner=True, num_predict=1024)
+    message = call_with_retry(messages, model=RAG_MODEL, num_predict=1024)
     if message is None:
         return "[오류] 모델이 계속 비정상적인 응답을 내서 포기했습니다."
     return message["content"]
@@ -456,7 +391,7 @@ def _simplify_for_layperson(content: str, valid_years: set[str], keyword: str = 
         {"role": "user", "content": f"[원문]\n{content}"},
     ]
     for attempt in range(2):
-        message = call_with_retry(messages, model=RAG_MODEL, inner=True, num_predict=1024)
+        message = call_with_retry(messages, model=RAG_MODEL, num_predict=1024)
         if message is None:
             print("    [경고] 쉬운 설명 생성 실패 - 원문 그대로 사용")
             return content
@@ -478,7 +413,7 @@ def _translate_abstract(article: dict) -> str | None:
         {"role": "system", "content": PUBMED_TRANSLATE_SYSTEM_PROMPT},
         {"role": "user", "content": f"제목: {article['title']}\n초록: {article['abstract'][:1500]}"},
     ]
-    message = call_with_retry(messages, model=RAG_MODEL, inner=True)
+    message = call_with_retry(messages, model=RAG_MODEL)
     return message["content"] if message else None
 
 
@@ -524,7 +459,7 @@ def search_pubmed_deep(keyword: str) -> str:
         {"role": "user", "content": f"[참고 요약]\n{context}\n\n[질문]\n{keyword}에 대한 최신 연구 결과를 알려줘."},
     ]
     for attempt in range(2):
-        message = call_with_retry(messages, model=RAG_MODEL, inner=True, num_predict=1024)
+        message = call_with_retry(messages, model=RAG_MODEL, num_predict=1024)
         if message is None:
             return "[오류] 모델이 계속 비정상적인 응답을 내서 포기했습니다."
         _log_pubmed_stage(f"synthesize_attempt_{attempt + 1}", keyword, message["content"])
@@ -535,56 +470,11 @@ def search_pubmed_deep(keyword: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 도구 등록 + 에이전트 루프
+# 상태 관리 + 결정론적 파이프라인
+# (예전엔 여기에 LLM에게 줄 도구 스펙(TOOLS)과 이름→함수 매핑(AVAILABLE_TOOLS)이
+#  있었지만, 도구 "선택"을 코드가 고정 순서로 정하는 구조로 바뀌면서 필요 없어짐 -
+#  각 도구 함수는 run_agent_turn()이 직접 호출한다.)
 # ---------------------------------------------------------------------------
-
-TOOLS = [
-    {"type": "function", "function": {
-        "name": "search_wikipedia",
-        "description": "위키피디아에서 질병명이나 의학 용어의 일반적인 설명/개요를 가져온다. '~가 뭐야' 같은 질문에 사용.",
-        "parameters": {"type": "object", "properties": {
-            "query": {"type": "string", "description": "검색할 질병명 또는 의학 용어"}}, "required": ["query"]},
-    }},
-    {"type": "function", "function": {
-        "name": "search_disease_code",
-        "description": "정확한 질병명, 표준 질병 코드(KCD), 영문 병명을 조회한다. '질병 코드가 뭐야' 같은 질문에 사용.",
-        "parameters": {"type": "object", "properties": {
-            "keyword": {"type": "string", "description": "정확히 아는 병명 키워드"}}, "required": ["keyword"]},
-    }},
-    {"type": "function", "function": {
-        "name": "search_symptom_info",
-        "description": (
-            "증상을 설명하는 자유로운 문장이나 병명을 받아서, 의미 기반 검색으로 관련 질환의 "
-            "증상/원인/치료 정보를 찾아 답한다. 정확한 병명을 몰라도 사용 가능 - "
-            "'머리 아프고 속이 메스꺼운데 뭘까' 같은 증상 설명 질문에 사용."
-        ),
-        "parameters": {"type": "object", "properties": {
-            "symptom_or_keyword": {"type": "string", "description": "증상 설명 문장 또는 병명"}},
-            "required": ["symptom_or_keyword"]},
-    }},
-    {"type": "function", "function": {
-        "name": "search_pubmed_deep",
-        "description": (
-            "PubMed 논문 초록을 실제로 찾아 번역하고 종합해서 근거 기반으로 답한다. "
-            "시간이 좀 걸리지만 신뢰도 높은 연구 요약이 필요할 때 사용. "
-            "'관련 논문 찾아줘', '연구 결과가 뭐야' 같은 질문에 사용."
-        ),
-        "parameters": {"type": "object", "properties": {
-            "keyword": {"type": "string", "description": "검색할 질병명/의학 주제"}}, "required": ["keyword"]},
-    }},
-]
-
-AVAILABLE_TOOLS = {
-    "search_wikipedia": search_wikipedia,
-    "search_disease_code": search_disease_code,
-    "search_symptom_info": search_symptom_info,
-    "search_pubmed_deep": search_pubmed_deep,
-}
-
-# 이 도구들은 내부에서 이미 근거 기반 최종 답변을 완성해서 돌려준다 -
-# 바깥쪽 에이전트가 또 재해석하면 할루시네이션이 재발할 수 있어 그대로 반환한다.
-DIRECT_ANSWER_TOOLS = {"search_symptom_info", "search_pubmed_deep"}
-
 
 class MedicalConversationState:
     """messages(대화 원문)와 별도로 유지하는 구조화된 상태.
@@ -657,37 +547,16 @@ def clean_disease_query(query: str) -> str:
     return known if known else query
 
 
-def _record_tool_call(state: MedicalConversationState, name: str, args: dict):
-    """도구 호출 하나를 보고 state에 규칙 기반으로 기록. LLM 사용 안 함.
-    도구 실행 때와 똑같이 clean_disease_query를 거쳐서 기록해야, "당뇨병"과
-    "당뇨병의 원인"이 state에서 서로 다른 질환으로 중복 기록되는 걸 막을 수 있음."""
-    if name == "search_wikipedia":
-        state.record_disease(clean_disease_query(args.get("query", "")), "search_wikipedia")
-    elif name == "search_disease_code":
-        state.record_disease(clean_disease_query(args.get("keyword", "")), "search_disease_code")
-    elif name == "search_pubmed_deep":
-        state.record_disease(clean_disease_query(args.get("keyword", "")), "search_pubmed_deep")
-    elif name == "search_symptom_info":
-        value = args.get("symptom_or_keyword", "")
-        # KDCA 사전에 있는 정확한 병명이면 "질환"으로, 아니면 자유 서술이니 "증상"으로 기록
-        if value in KDCA_CORPUS:
-            state.record_disease(value, "search_symptom_info")
-        else:
-            state.record_symptom(value, "search_symptom_info")
-
-
 # ---------------------------------------------------------------------------
-# 도구 선택 방식 전환: 지금까지는 LLM(TOOLS + call_with_retry)이 4개 도구 중
-# 뭘 쓸지 매번 자유롭게 판단했는데, 하루 종일 겪은 불안정성의 상당 부분이
-# "작은 모델이 도구 선택 자체를 못 미더워한다"는 거였음. 그래서 순서를
-# 코드로 고정하는 파이프라인으로 바꾼다 - LLM은 이제 도구 선택에 관여하지
-# 않고, PubMed 내부(번역/종합)에서만 쓰인다.
+# 도구 선택 방식: LLM이 4개 도구 중 뭘 쓸지 매번 자유롭게 판단하게 했더니
+# 하루 종일 겪은 불안정성의 상당 부분이 "작은 모델이 도구 선택 자체를 못
+# 미더워한다"는 거였음. 그래서 순서를 코드로 고정하는 파이프라인으로 바꿈 -
+# LLM은 도구 선택에 전혀 관여하지 않고, PubMed 내부(번역/종합/재설명)에서만
+# 쓰인다.
 #   1) KDCA 건강포털 RAG 먼저 시도
 #   2) 실패하면(근거 부족) 위키피디아로 대체
 #   3) 정확한 병명을 알아냈으면 공식 코드도 같이
 #   4) 질문에 "논문"/"연구" 같은 표현이 있으면 PubMed 심층 검색 추가
-# (TOOLS/AVAILABLE_TOOLS/is_outer_response_ok 등 기존 LLM 기반 선택 로직은
-# 아래 함수들이 재사용하는 검색 함수 자체는 그대로 쓰되, "선택" 부분만 대체됨)
 # ---------------------------------------------------------------------------
 
 RESEARCH_KEYWORDS = ("논문", "연구", "study", "리서치", "research")
