@@ -44,7 +44,16 @@ DISEASE_API_URL = "http://apis.data.go.kr/B551182/diseaseInfoService1/getDissNam
 DISEASE_API_KEY = os.environ.get("DISEASE_INFO_SERVICE_KEY")
 
 KDCA_EMBEDDINGS_PATH = os.path.join(os.path.dirname(__file__), "data", "kdca_embeddings_clean.json")
-MIN_SIMILARITY_SYMPTOM = 0.45
+MIN_SIMILARITY_SYMPTOM = 0.6
+# 0.45였을 때 "주사피부염인데 어떻게 조심해야돼"가 코퍼스에 없는데도 "열상"(0.58,
+# 칼에 베인 상처 - 완전히 무관)을 근거인 것처럼 받아들여서 엉뚱한 내용을 확신에
+# 차서 답한 사례를 발견함(2026-09-23). 실측해보니 정답 문서 자체도 0.52~0.69
+# 범위라 "틀린 매칭"과 "맞는 매칭"이 겹쳐서, 단순 문턱값으로 완전히 가를 순
+# 없었음 - 그래도 0.6으로 올리면 정확한 병명/강한 매칭(0.61~0.74)은 그대로
+# 통과하고, 애매한 매칭(주사피부염 사례 포함, 0.5대)은 걸러져서 위키피디아로
+# 넘어감 - "약한 근거로 확신에 찬 오답" 대신 "모르면 바로 다음 수단으로 넘어간다"는
+# 원칙(사용자 지시)에 맞춘 것. 대가: "속이 쓰리고 아파요"→위식도역류질환(0.58)처럼
+# 실제로 괜찮았을 애매한 매칭도 이제 위키피디아로 넘어감(정확함 우선, 보수적 선택).
 
 PUBMED_DEBUG_LOG_PATH = os.path.join(os.path.dirname(__file__), "data", "pubmed_debug_log.jsonl")
 
@@ -151,6 +160,14 @@ def call_with_retry(messages, model: str = RAG_MODEL, max_retries: int = 1, num_
 # 도구 1, 2: A단계 그대로 (위키피디아, 공식 병명/코드)
 # ---------------------------------------------------------------------------
 
+MIN_SIMILARITY_WIKIPEDIA = 0.4
+# 위키피디아 자체 검색(srsearch)은 KDCA 임베딩 검색과 달리 "이 결과가 실제로
+# 관련 있는가"를 알려주는 점수가 없어서, 오타나 낯선 표기가 섞이면 완전히
+# 무관한 문서를 fuzzy하게 찾아오는 걸 확인함(예: "주사피부부염"(오타) -> "나혜석"
+# [무관한 인물], "로사시아" -> "사시"[사팔뜨기], 2026-09-23). 그래서 문서를
+# 찾아온 뒤 우리 자신의 임베딩으로 "질문과 본문이 실제로 관련 있는지" 한 번 더
+# 검증한다. 실측: 무관한 오검색 0.17~0.28, 정말 관련 있는 검색 0.53~0.71로
+# 뚜렷한 간격이 있어서 0.4로 잡음(KDCA 쪽과 달리 여긴 깔끔하게 갈림).
 def search_wikipedia(query: str) -> str:
     query = clean_disease_query(query)
     search_resp = requests.get(
@@ -171,6 +188,14 @@ def search_wikipedia(query: str) -> str:
     pages = extract_resp.json()["query"]["pages"]
     page = next(iter(pages.values()))
     extract = page.get("extract", "").strip()
+    if not extract:
+        return f"'{query}'에 대한 위키피디아 검색 결과가 없습니다."
+
+    relevance = cosine_similarity(embed(query), embed(extract[:1000]))
+    if relevance < MIN_SIMILARITY_WIKIPEDIA:
+        print(f"    [경고] 위키피디아 결과 '{title}'가 질문과 무관해 보임(유사도 {relevance:.2f}) - 버림")
+        return f"'{query}'에 대한 위키피디아 검색 결과가 없습니다."
+
     return f"[위키피디아 - {title}]\n{extract[:1000]}"
 
 
@@ -536,15 +561,35 @@ def find_known_term_in_text(text: str) -> str | None:
     return None
 
 
+_TRAILING_PARTICLES_RE = re.compile(
+    r"(이나|라서|이라서|인데|인지|이면|랑|이랑|과|와|은|는|이|가|을|를|의|도|만|면)+$"
+)
+
+
 def clean_disease_query(query: str) -> str:
     """LLM이 도구 인자에 조사/수식어를 붙여서 만드는 문제(예: '당뇨병' 대신
     '당뇨병의 설명', '당뇨병의 원인')를 정리한다. 위키피디아/공식코드/PubMed는
     "정확한 병명"이어야 제대로 매칭되는데, 수식어가 붙으면 완전히 다른 문서가
     검색될 수 있음 (실제로 "당뇨병의 설명"으로 검색해서 "당뇨병성 케톤산증"이
     나온 사례 발생). KDCA 사전에 있는 병명이 쿼리 안에 포함돼 있으면 그 병명만
-    추출해서 쓰고, 못 찾으면 원래 쿼리를 그대로 둔다."""
+    추출해서 쓴다.
+
+    KDCA 사전에도 없는 완전히 새 단어면(예: "주사피부염") 예전엔 원본 문장을
+    그대로 반환했는데, 그 문장을 통째로 위키피디아 검색에 넘기면("주사피부염인데
+    어떻게 조심해야돼?") 물음표·어미까지 다 들어가서 완전히 무관한 문서(실제로
+    "나혜석"이라는 인물 문서)가 나오는 걸 확인함(2026-09-23). 그래서 known_term을
+    못 찾으면, 문장 맨 앞 어절에서 흔한 조사/연결어미를 떼어내 병명 후보를
+    만들어본다 - 완벽하진 않지만("머리가 지끈거리고 아파요" -> "머리" 정도로만
+    깎임) 문장 전체를 그대로 넘기는 것보다는 훨씬 안전하다."""
     known = find_known_term_in_text(query)
-    return known if known else query
+    if known:
+        return known
+    stripped = query.strip()
+    if not stripped:
+        return query
+    first_chunk = stripped.split()[0]
+    candidate = _TRAILING_PARTICLES_RE.sub("", first_chunk)
+    return candidate if candidate else query
 
 
 # ---------------------------------------------------------------------------
@@ -608,7 +653,12 @@ def resolve_query_with_context(user_question: str, state: MedicalConversationSta
 
 
 def _is_failure_message(text: str) -> bool:
-    return ("찾지 못" in text) or ("답변할 수 없습니다" in text) or ("설정되지 않았습니다" in text)
+    return (
+        ("찾지 못" in text)
+        or ("답변할 수 없습니다" in text)
+        or ("설정되지 않았습니다" in text)
+        or ("검색 결과가 없습니다" in text)
+    )
 
 
 def run_agent_turn(messages: list, user_question: str, state: MedicalConversationState) -> str:
