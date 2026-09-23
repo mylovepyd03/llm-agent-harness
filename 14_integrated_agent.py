@@ -315,13 +315,37 @@ def search_symptom_info(symptom_or_keyword: str, question_text: str | None = Non
 # 도구 4: PubMed 심층 RAG (13단계) - "직접 답변" 도구
 # ---------------------------------------------------------------------------
 
+TERM_TRANSLATE_SYSTEM_PROMPT = (
+    "당신은 한국어 의학 용어를 표준 영어 의학 용어로 번역하는 도우미입니다.\n"
+    "주어진 한국어 병명/의학 용어에 해당하는 영어 이름만 한 줄로 출력하세요.\n"
+    "설명, 따옴표, 다른 말은 절대 덧붙이지 마세요. 확실하지 않아도 가장 가능성\n"
+    "높은 영어 이름을 추정해서 답하세요."
+)
+
+
+def _translate_term_to_english(keyword: str) -> str:
+    """HIRA 공식 코드 DB에 없는 병명(예: '주사피부염')은 한글 그대로 PubMed에
+    넘기면 검색 결과가 0건이 된다(실측 확인) - PubMed는 영어 문헌 DB라서 당연함.
+    HIRA 조회가 실패했을 때 llama3.1에게 영어 이름을 추정 번역시켜서 이 문제를
+    우회한다."""
+    messages = [
+        {"role": "system", "content": TERM_TRANSLATE_SYSTEM_PROMPT},
+        {"role": "user", "content": keyword},
+    ]
+    message = call_with_retry(messages, model=RAG_MODEL)
+    if message is None:
+        return keyword
+    translated = message["content"].strip().strip("\"'").splitlines()[0].strip()
+    return translated if translated else keyword
+
+
 def _to_english_query(keyword: str) -> str:
     if not re.search(r"[가-힣]", keyword):
         return keyword
     items = _get_disease_items(keyword)
     if items and items[0]["sickEngNm"]:
         return items[0]["sickEngNm"]
-    return keyword
+    return _translate_term_to_english(keyword)
 
 
 def _pubmed_esearch(query: str, retmax: int = 10) -> list[str]:
@@ -562,7 +586,9 @@ def find_known_term_in_text(text: str) -> str | None:
 
 
 _TRAILING_PARTICLES_RE = re.compile(
-    r"(이나|라서|이라서|인데|인지|이면|랑|이랑|과|와|은|는|이|가|을|를|의|도|만|면)+$"
+    r"(이었을때|였을때|일때|을때|할때|이라면|라면|이었으면|이나|라서|이라서|인데|인지|"
+    r"이면|이고|이지만|이라도|일까요|일까|인가요|인가|랑|이랑|과|와|은|는|이|가|을|를|"
+    r"의|도|만|면)+$"
 )
 
 
@@ -653,8 +679,15 @@ def resolve_query_with_context(user_question: str, state: MedicalConversationSta
 
 
 def _is_failure_message(text: str) -> bool:
+    # 도구들이 반환하는 실패 메시지는 전부 "[오류]"로 시작하거나 아래 문구 중
+    # 하나를 포함하도록 맞춰 왔는데, 새 실패 메시지를 추가할 때마다 여기 목록에
+    # 반영하는 걸 깜빡해서 실제로 실패 메시지가 성공으로 오인된 사례가 두 번
+    # 있었음(위키피디아 "검색 결과가 없습니다", search_symptom_info의 "[오류]
+    # 모델이... 포기했습니다") - "[오류]" 접두사 체크를 추가해서 앞으로 새
+    # 오류 메시지를 추가해도 이 접두사만 지키면 자동으로 잡히게 함.
     return (
-        ("찾지 못" in text)
+        text.startswith("[오류]")
+        or ("찾지 못" in text)
         or ("답변할 수 없습니다" in text)
         or ("설정되지 않았습니다" in text)
         or ("검색 결과가 없습니다" in text)
@@ -683,28 +716,40 @@ def run_agent_turn(messages: list, user_question: str, state: MedicalConversatio
             # 2) 실패하면 위키피디아로 대체 (아까 "위염"처럼 KDCA에 내용이 비어있는 경우 등)
             print("  [파이프라인] 건강포털 RAG 실패 -> 위키피디아로 대체")
             wiki_result = search_wikipedia(known_term or user_question)
-            if _is_failure_message(wiki_result):
-                messages.pop()
-                state.turn -= 1
-                return (
-                    "이 질문은 제가 다루는 건강/의료 정보 범위를 벗어났거나, "
-                    "제가 아는 정보로는 답변하기 어려운 내용인 것 같아요. "
-                    "증상이나 병명을 조금 더 구체적으로 말씀해주시겠어요?"
-                )
-            parts.append(wiki_result)
-            if known_term:
-                state.record_disease(known_term, "search_wikipedia(fallback)")
+            if not _is_failure_message(wiki_result):
+                parts.append(wiki_result)
+                if known_term:
+                    state.record_disease(known_term, "search_wikipedia(fallback)")
+                else:
+                    # 위키피디아 결과 형식 "[위키피디아 - 제목]\n..."에서 실제 문서 제목을
+                    # 뽑아 기록. 정확한 병명이 아니라 사용자의 증상 서술로 여기까지 왔으므로,
+                    # 서술 자체는 "증상"으로, 매칭된 병명은 "추정 질환"으로 같이 남긴다 -
+                    # 여러 턴에 걸쳐 증상이 쌓이고 같은 질환이 후보로 반복되면 문진처럼
+                    # 좁혀지는 걸 state.summary()에서 볼 수 있게 하기 위함.
+                    title_match = re.match(r"\[위키피디아 - (.+?)\]", wiki_result)
+                    if title_match:
+                        matched_name = title_match.group(1)
+                        state.record_symptom(user_question, f"search_wikipedia(fallback, 추정: {matched_name})")
+                        state.record_disease(matched_name, "search_wikipedia(fallback, 증상 매칭 추정)")
             else:
-                # 위키피디아 결과 형식 "[위키피디아 - 제목]\n..."에서 실제 문서 제목을
-                # 뽑아 기록. 정확한 병명이 아니라 사용자의 증상 서술로 여기까지 왔으므로,
-                # 서술 자체는 "증상"으로, 매칭된 병명은 "추정 질환"으로 같이 남긴다 -
-                # 여러 턴에 걸쳐 증상이 쌓이고 같은 질환이 후보로 반복되면 문진처럼
-                # 좁혀지는 걸 state.summary()에서 볼 수 있게 하기 위함.
-                title_match = re.match(r"\[위키피디아 - (.+?)\]", wiki_result)
-                if title_match:
-                    matched_name = title_match.group(1)
-                    state.record_symptom(user_question, f"search_wikipedia(fallback, 추정: {matched_name})")
-                    state.record_disease(matched_name, "search_wikipedia(fallback, 증상 매칭 추정)")
+                # 3) 위키피디아까지 실패하면 PubMed로 마지막 시도 (건강정보포털/
+                # 위키피디아 둘 다 없는 병명이라도, PubMed는 영어 의학 문헌
+                # 전체를 대상으로 하므로 찾을 가능성이 있음 - "주사피부염"처럼
+                # 국내 자료엔 드물지만 해외 연구는 많은 경우가 실제로 있었음).
+                print("  [파이프라인] 위키피디아도 실패 -> PubMed로 마지막 시도")
+                fallback_keyword = known_term or clean_disease_query(user_question)
+                pubmed_result = search_pubmed_deep(fallback_keyword)
+                if _is_failure_message(pubmed_result):
+                    messages.pop()
+                    state.turn -= 1
+                    return (
+                        "이 질문은 제가 다루는 건강/의료 정보 범위를 벗어났거나, "
+                        "제가 아는 정보로는 답변하기 어려운 내용인 것 같아요. "
+                        "증상이나 병명을 조금 더 구체적으로 말씀해주시겠어요?"
+                    )
+                parts.append(pubmed_result)
+                state.record_symptom(user_question, f"search_pubmed_deep(fallback, 추정: {fallback_keyword})")
+                state.record_disease(fallback_keyword, "search_pubmed_deep(fallback)")
         else:
             print("  [파이프라인] 건강포털 RAG 성공")
             parts.append(rag_result)
