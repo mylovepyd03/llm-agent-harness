@@ -44,6 +44,11 @@ DISEASE_API_URL = "http://apis.data.go.kr/B551182/diseaseInfoService1/getDissNam
 DISEASE_API_KEY = os.environ.get("DISEASE_INFO_SERVICE_KEY")
 
 KDCA_EMBEDDINGS_PATH = os.path.join(os.path.dirname(__file__), "data", "kdca_embeddings_clean.json")
+CONTEXT_SCORE_MARGIN = 0.06
+# 참고자료로 넣을 문서를 1등 점수에서 이만큼 안쪽으로만 제한한다(위 search_symptom_info
+# 참고). 실측 기준: 소화불량 0.68 / 대사증후군 0.56 - 0.12 차이면 다른 주제로 보는 게 맞고,
+# 문진 경로의 소화불량 0.578 / 복통 0.565처럼 0.013 차이면 둘 다 관련 있는 자료로 본다.
+
 MIN_SIMILARITY_SYMPTOM = 0.6
 # 0.45였을 때 "주사피부염인데 어떻게 조심해야돼"가 코퍼스에 없는데도 "열상"(0.58,
 # 칼에 베인 상처 - 완전히 무관)을 근거인 것처럼 받아들여서 엉뚱한 내용을 확신에
@@ -61,6 +66,11 @@ PUBMED_ESEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi
 PUBMED_EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 PUBMED_CONTACT = {"tool": "llm-agent-harness-learning-project", "email": "paranvit@gmail.com"}
 MIN_SIMILARITY_PUBMED = 0.4
+
+# MedlinePlus(미국 NIH 소비자 건강정보). 키 없이 쓸 수 있고, 애초에 건강 주제만
+# 담긴 DB라서 위키피디아처럼 "만화/인물 문서가 걸리는" 문제가 구조적으로 없다.
+MEDLINEPLUS_SEARCH_URL = "https://wsearch.nlm.nih.gov/ws/query"
+MIN_SIMILARITY_MEDLINEPLUS = 0.5
 
 
 class _LegacySSLAdapter(HTTPAdapter):
@@ -449,19 +459,35 @@ def truncate_at_sentence(text: str, max_chars: int) -> str:
     return text  # 그 뒤로 문장부호가 아예 없으면 끝까지 다 포함
 
 
-def search_symptom_info(symptom_or_keyword: str, question_text: str | None = None) -> str:
+def search_symptom_info(symptom_or_keyword: str, question_text: str | None = None,
+                        min_similarity: float | None = None) -> str:
     """증상 문장이나 병명을 자유롭게 받아서, 관련 질환을 의미 기반으로 찾아 답한다.
     search_text(=symptom_or_keyword)는 검색(임베딩 매칭) 전용이고, question_text는
-    LLM에게 보여줄 [질문] 부분 전용이다 - 분리하는 이유는 아래 참고."""
+    LLM에게 보여줄 [질문] 부분 전용이다 - 분리하는 이유는 아래 참고.
+
+    min_similarity를 따로 넘길 수 있게 둔 이유: 문진으로 정보를 모으고 검색어를
+    정규화한 뒤의 검색은 근거가 더 탄탄해서(실측: 구어체 원문은 '파라티푸스'
+    0.52로 엉뚱하게 매칭되지만, 정규화한 '상복부 통증 식후 악화'는 소화불량
+    0.578/복통 0.565로 적절하게 매칭됨) 기본 기준(0.6)보다 조금 낮춰도 안전하다."""
     question_text = question_text or symptom_or_keyword
+    threshold = MIN_SIMILARITY_SYMPTOM if min_similarity is None else min_similarity
 
     results = search_kdca(symptom_or_keyword, top_k=5)
-    if not results or results[0][1] < MIN_SIMILARITY_SYMPTOM:
+    if not results or results[0][1] < threshold:
         return "관련된 건강정보를 찾지 못해 답변할 수 없습니다. 증상을 좀 더 구체적으로 말씀해주세요."
 
     print("    [검색됨]", ", ".join(f"{n}({s:.2f})" for n, s, _ in results[:3]))
+    # 1등과 점수가 많이 떨어지는 항목은 참고자료에서 뺀다. 예전엔 무조건 상위 3개를
+    # 넣었는데, "소화불량"(0.68)과 함께 "대사증후군"(0.56)·"보툴리눔독소증"(0.54)까지
+    # 들어가서 LLM이 "소화불량의 원인이 대사증후군, 보툴리눔독소증과 관련 있을 수
+    # 있다"는 식으로 없는 인과관계를 만들어내는 일이 실제로 발생함(2026-10-01).
+    top_score = results[0][1]
+    selected = [r for r in results[:3] if r[1] >= max(threshold, top_score - CONTEXT_SCORE_MARGIN)]
+    if len(selected) < len(results[:3]):
+        dropped = [f"{n}({s:.2f})" for n, s, _ in results[:3] if (n, s) not in [(sn, ss) for sn, ss, _ in selected]]
+        print(f"    [참고자료 제외] 1등과 차이가 커서 제외: {', '.join(dropped)}")
     context = "\n\n".join(
-        f"[{name}]\n{truncate_at_sentence(entry['text'], 800)}" for name, score, entry in results[:3]
+        f"[{name}]\n{truncate_at_sentence(entry['text'], 800)}" for name, score, entry in selected
     )
     messages = [
         {"role": "system", "content": SYMPTOM_RAG_SYSTEM_PROMPT},
@@ -474,6 +500,160 @@ def search_symptom_info(symptom_or_keyword: str, question_text: str | None = Non
     if message is None:
         return "[오류] 모델이 계속 비정상적인 응답을 내서 포기했습니다."
     return message["content"]
+
+
+# ---------------------------------------------------------------------------
+# 도구 5: MedlinePlus(미국 NIH) RAG - "직접 답변" 도구
+#
+# 설계 원칙(사용자 지시): **번역은 '병명 키워드 매핑'부터.** 자유 번역에 맡기면
+# "주사"를 injection으로 오역하는 식의 사고가 나므로, _to_english_query()의
+# 매핑 순서(HIRA 공식 영문명 -> 위키피디아 언어간 링크 -> 그래도 없으면 LLM 추정)를
+# 그대로 쓴다. 그리고 MedlinePlus가 문서마다 주는 title/altTitle(= 주제 태그)에
+# 그 병명이 직접 걸리는지를 1순위 근거로 보고, 임베딩 유사도는 보조로만 쓴다.
+# ---------------------------------------------------------------------------
+
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _strip_html(text: str) -> str:
+    """MedlinePlus 응답 본문에는 <p>, <ul> 같은 태그와 검색어 하이라이트
+    <span class="qt0">가 그대로 들어있어서 걷어낸다."""
+    return re.sub(r"\s+", " ", _HTML_TAG_RE.sub(" ", text or "")).strip()
+
+
+def _medlineplus_search(english_term: str, retmax: int = 5) -> list[dict]:
+    response = requests.get(
+        MEDLINEPLUS_SEARCH_URL,
+        params={"db": "healthTopics", "term": english_term, "retmax": retmax},
+        headers=WIKI_HEADERS, timeout=10,
+    )
+    response.raise_for_status()
+    root = ET.fromstring(response.text)
+    docs = []
+    for doc in root.findall(".//document"):
+        title, summary, alt_titles = "", "", []
+        for content in doc.findall("content"):
+            value = _strip_html("".join(content.itertext()))
+            name = content.get("name")
+            if name == "title":
+                title = value
+            elif name == "altTitle":
+                alt_titles.append(value)
+            elif name == "FullSummary":
+                summary = value
+        if title and summary:
+            docs.append({"title": title, "alt_titles": alt_titles,
+                         "summary": summary, "url": doc.get("url", "")})
+    return docs
+
+
+def _tag_match_kind(english_term: str, doc: dict) -> str | None:
+    """병명이 문서의 주제 태그에 어떻게 걸렸는지 구분해서 돌려준다.
+
+    - "title": 문서 제목 자체가 그 병명 (예: 'rosacea' -> "Rosacea") = 가장 확실
+    - "alt": 제목은 더 넓은 주제인데 altTitle로만 걸림
+      (예: 'gastritis' -> "Stomach Disorders"의 altTitle) = 그 병을 '포함하는'
+      일반 문서라는 뜻이므로, 이걸로 그 병을 구체적으로 설명하게 하면 LLM이
+      없는 내용을 지어낸다(실제 발생: 위염의 증상/원인/수술 여부를 날조,
+      2026-10-02). 그래서 이 경우 프롬프트에 "넓은 주제의 일반 설명"이라고
+      명시해서 날조를 막는다.
+    - None: 태그에 안 걸림(임베딩 유사도로만 판단)
+    """
+    term = english_term.strip().lower()
+    if len(term) < 4:
+        return None
+    title = doc["title"].lower()
+    if title and (term == title or term in title or title in term):
+        return "title"
+    for alt in doc["alt_titles"]:
+        a = alt.lower()
+        if a and (term == a or term in a or a in term):
+            return "alt"
+    return None
+
+
+MEDLINEPLUS_SUMMARY_SYSTEM_PROMPT = (
+    "당신은 미국 NIH MedlinePlus의 영문 건강정보를 한국어로 정리해주는 "
+    "친절한 건강정보 도우미입니다.\n"
+    "반드시 아래 [참고자료]에 있는 내용만 근거로, 한국어로 번역하면서 사용자 "
+    "질문에 맞게 요약하세요. 참고자료에 없는 내용은 절대 지어내지 마세요.\n"
+    "영어 단어를 그대로 두지 말고 자연스러운 한국어로 옮기세요(필요하면 의학 "
+    "용어 뒤에 괄호로 짧은 설명을 덧붙이세요).\n"
+    "구체적인 약물 이름은 나열하지 말고, 필요하면 '약물치료' 정도로만 언급하세요.\n"
+    "이건 진단이 아니라 참고 정보이므로 단정하지 말고, 증상이 지속되면 병원 진료를 "
+    "권하세요.\n"
+    "질문 문장을 그대로 되풀이하지 말고, 바로 본론부터 4~6문장 정도로 답하세요."
+)
+
+
+def _summarize_medlineplus(keyword: str, doc: dict, match_kind: str | None) -> str:
+    caveat = ""
+    if match_kind != "title":
+        # 제목이 질문한 병명과 다르면(더 넓은 주제 문서면) 그 사실을 LLM에게
+        # 분명히 알려서, 자료에 없는 내용을 그 병명의 증상/원인/치료라고
+        # 지어내는 것을 막는다.
+        caveat = (
+            f"\n\n[주의] 이 자료는 '{doc['title']}'라는 더 넓은 주제의 일반 설명이며, "
+            f"'{keyword}'만을 다룬 자료가 아닙니다. 자료에 적혀 있지 않은 내용을 "
+            f"'{keyword}'의 증상·원인·치료라고 쓰지 마세요. 자료에 담긴 일반적인 "
+            f"내용만 전달하고, '{keyword}'에 대한 구체적인 설명이 자료에 없으면 "
+            "그 사실을 솔직히 밝히세요."
+        )
+    messages = [
+        {"role": "system", "content": MEDLINEPLUS_SUMMARY_SYSTEM_PROMPT},
+        {"role": "user",
+         "content": f"[참고자료 - {doc['title']}]\n{doc['summary'][:1500]}\n\n[질문]\n{keyword}{caveat}"},
+    ]
+    message = call_with_retry(messages, model=RAG_MODEL, num_predict=1024)
+    if message is None:
+        return "[오류] 모델이 계속 비정상적인 응답을 내서 포기했습니다."
+    source = f"(출처: MedlinePlus '{doc['title']}'"
+    source += f" - {doc['url']})" if doc["url"] else ")"
+    return f"{message['content']}\n\n{source}"
+
+
+def search_medlineplus(keyword: str) -> str:
+    """MedlinePlus(NIH)에서 병명으로 건강정보를 찾아 한국어로 요약해 답한다."""
+    keyword = clean_disease_query(keyword)
+    english_term = _to_english_query(keyword)
+    if re.search(r"[가-힣]", english_term):
+        # 영문 매핑에 실패하면(한글이 그대로 남으면) 영문 DB 검색이 무의미하다
+        return f"'{keyword}'의 영문 병명을 확인하지 못해 MedlinePlus 검색 결과가 없습니다."
+
+    docs = _medlineplus_search(english_term)
+    if not docs and " " in english_term:
+        # HIRA 공식 영문명은 "Gastritis and duodenitis"처럼 여러 단어인 경우가 있고,
+        # 그 구문 전체로는 MedlinePlus에서 0건이 나온다(실측). 핵심 단어 하나로
+        # 다시 찾아본다("Gastritis" -> Stomach Disorders 문서가 정상 매칭됨).
+        head_term = english_term.split()[0]
+        print(f"    [MedlinePlus] '{english_term}' 0건 -> 핵심 단어 '{head_term}'로 재검색")
+        docs = _medlineplus_search(head_term)
+        if docs:
+            english_term = head_term
+    if not docs:
+        return f"'{keyword}'({english_term})에 대한 MedlinePlus 검색 결과가 없습니다."
+
+    # 1순위: 제목이 곧 그 병명인 문서, 2순위: altTitle로 걸린(더 넓은 주제) 문서,
+    # 3순위: 태그에 안 걸려서 임베딩 유사도로만 보는 문서
+    kinds = {id(d): _tag_match_kind(english_term, d) for d in docs}
+    by_title = [d for d in docs if kinds[id(d)] == "title"]
+    by_alt = [d for d in docs if kinds[id(d)] == "alt"]
+    pool = by_title or by_alt or docs
+    query_vec = embed(english_term)
+    scored = [(d, cosine_similarity(query_vec, embed(d["summary"][:1000]))) for d in pool]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    best, best_score = scored[0]
+    match_kind = kinds[id(best)]
+
+    print(f"    [MedlinePlus] '{english_term}' -> '{best['title']}' "
+          f"(태그={match_kind or '없음'}, 유사도={best_score:.2f})")
+
+    # 제목이 곧 그 병명이면 그 자체로 강한 근거이므로 유사도 기준을 적용하지 않는다.
+    # 그 외(더 넓은 주제이거나 태그에 안 걸린 경우)는 유사도 기준을 지켜야 한다.
+    if match_kind != "title" and best_score < MIN_SIMILARITY_MEDLINEPLUS:
+        return f"'{keyword}'({english_term})에 대한 MedlinePlus 검색 결과가 없습니다."
+
+    return _summarize_medlineplus(keyword, best, match_kind)
 
 
 # ---------------------------------------------------------------------------
@@ -711,6 +891,30 @@ class MedicalConversationState:
         self.awaiting_followup_reply = False  # 직전 답변이 후속 질문으로 끝났으면 True -
                                                # 다음 입력이 "네", "심해요"처럼 지칭어 없는
                                                # 짧은 대답이어도 이전 주제를 이어받게 함
+        # 문진(問診) 상태: 증상이 막연해서 되물었을 때, 원래 호소와 이후 받은
+        # 답변들을 모아둔다. 이게 없으면 "배가 살살 아파" -> (되묻기) -> "저녁부터"
+        # 라고 답했을 때 "저녁부터"를 새로운 증상 검색어로 취급해서 "못 찾았다"고
+        # 답하는 버그가 생김(2026-10-01 실제 발생). 사용자의 답변은 증상이 아니라
+        # 시간/빈도/정도일 수 있으므로, 독립 질의가 아니라 원래 호소의 '추가 정보'로
+        # 누적해서 다뤄야 한다.
+        self.pending_complaint: str | None = None
+        self.followup_answers: list[str] = []
+
+    def start_interview(self, complaint: str):
+        self.pending_complaint = complaint
+        self.followup_answers = []
+
+    def add_interview_answer(self, answer: str):
+        self.followup_answers.append(answer)
+
+    def interview_description(self) -> str:
+        """원래 증상 호소 + 지금까지 받은 답변들을 합친 설명."""
+        parts = [self.pending_complaint or ""] + self.followup_answers
+        return " ".join(p for p in parts if p).strip()
+
+    def end_interview(self):
+        self.pending_complaint = None
+        self.followup_answers = []
 
     def record_disease(self, name: str, source: str):
         """같은 질환이 또 언급되면 새 항목을 만들지 않고, 기존 항목의 횟수/최근턴/출처만 갱신."""
@@ -883,19 +1087,22 @@ CLARIFY_SYSTEM_PROMPT = (
     "부족한 상황입니다.\n"
     "**절대 질환명을 추측하거나 원인을 단정하지 마세요.** 아는 척하지 말고, "
     "자료에 없는 설명을 덧붙이지도 마세요.\n"
-    "사용자가 말한 증상 표현을 자연스럽게 받아서, 진단에 도움이 될 내용을 2~3가지만 "
-    "구체적으로 물어보세요(그 증상에 실제로 맞는 질문이어야 합니다 - 예: 언제부터인지, "
-    "어떤 느낌/정도인지, 같이 나타나는 다른 증상, 식사·수면·활동과의 관계 등).\n"
+    "[지금까지 들은 내용]에 이미 나온 것은 다시 묻지 말고, 아직 모르는 것만 "
+    "2가지 이내로 구체적으로 물어보세요(그 증상에 실제로 맞는 질문이어야 합니다 - "
+    "예: 언제부터인지, 어떤 느낌/정도인지, 같이 나타나는 다른 증상, 식사·수면·"
+    "활동과의 관계 등).\n"
     "전체 3문장 이내로 짧고 따뜻하게 답하세요."
 )
 
 
-def ask_for_more_detail(user_question: str) -> str:
+def ask_for_more_detail(complaint: str, answers: list[str] | None = None) -> str:
     """병명이 아니라 짧은 증상 호소일 때, 엉뚱한 검색 결과를 들이대는 대신
-    증상을 더 물어본다. 고정 문구가 아니라 LLM이 그 증상에 맞는 질문을 하도록 함."""
+    증상을 더 물어본다. 고정 문구가 아니라 LLM이 그 증상에 맞는 질문을 하도록 하고,
+    이미 들은 내용(answers)은 또 묻지 않도록 함께 넘긴다."""
+    heard = "\n".join(f"- {a}" for a in (answers or [])) or "- (아직 없음)"
     messages = [
         {"role": "system", "content": CLARIFY_SYSTEM_PROMPT},
-        {"role": "user", "content": user_question},
+        {"role": "user", "content": f"[증상 호소]\n{complaint}\n\n[지금까지 들은 내용]\n{heard}"},
     ]
     message = call_with_retry(messages, model=RAG_MODEL, num_predict=400)
     if message is None:
@@ -905,6 +1112,37 @@ def ask_for_more_detail(user_question: str) -> str:
             "말씀해주시겠어요?"
         )
     return message["content"]
+
+
+SYMPTOM_NORMALIZE_SYSTEM_PROMPT = (
+    "당신은 환자가 구어체로 말한 증상 설명을, 의학 자료 검색에 쓸 검색어로 "
+    "바꿔주는 도우미입니다.\n"
+    "주어진 설명에 **실제로 적혀 있는** 증상/부위/양상만 사용해서, 의학 자료에 "
+    "쓰이는 표현의 명사 위주 검색어로 다시 쓰세요.\n"
+    "**설명에 없는 말은 절대 추가하지 마세요.** 특히 시간·상황·악화요인(식후, "
+    "야간, 운동 시 등)은 설명에 그 말이 실제로 있을 때만 쓰세요. 질환명을 "
+    "추측해서 넣는 것도 금지입니다.\n"
+    "아래 예시는 '바꾸는 방식'만 참고하고, 예시에 나온 단어를 가져다 쓰지 마세요.\n"
+    "예: '목이 칼칼하고 기침이 나' -> '인후 통증 기침'\n"
+    "설명이나 따옴표 없이, 검색어만 한 줄로 출력하세요."
+)
+
+
+def normalize_symptom_query(description: str) -> str:
+    """구어체 증상 설명을 KDCA 자료에 가까운 검색어로 바꾼다. KDCA 코퍼스는
+    의학 문서 문체라서 "배가 살살 아파 저녁부터" 같은 구어체와는 임베딩 거리가
+    멀다 - 문진으로 정보를 모아도 그대로는 검색이 안 맞아서, 검색 직전에 한 번
+    표현만 정규화한다(질환명 추측은 금지해서 할루시네이션 여지를 줄임).
+    실패하면 원문을 그대로 쓴다."""
+    messages = [
+        {"role": "system", "content": SYMPTOM_NORMALIZE_SYSTEM_PROMPT},
+        {"role": "user", "content": description},
+    ]
+    message = call_with_retry(messages, model=RAG_MODEL, num_predict=120)
+    if message is None:
+        return description
+    normalized = message["content"].strip().strip("\"'").splitlines()[0].strip()
+    return normalized or description
 
 
 def _is_failure_message(text: str) -> bool:
@@ -923,6 +1161,92 @@ def _is_failure_message(text: str) -> bool:
     )
 
 
+MAX_INTERVIEW_ROUNDS = 2
+# 문진으로 몇 번까지 더 물어볼지. 계속 되묻기만 하면 사용자가 지치므로, 2번까지
+# 물어본 뒤에는 모은 내용으로 검색해보고 안 되면 솔직하게 마무리한다.
+
+MIN_SIMILARITY_INTERVIEW = 0.55
+# 문진으로 모은 정보 + 검색어 정규화를 거친 뒤의 검색에 쓰는 기준(기본 0.6보다 낮음).
+# 근거: 구어체 원문으로 검색하면 엉뚱한 게 1등이 되지만(파라티푸스 0.52),
+# 정규화를 거치면 의학적으로 적절한 항목이 1등이 됨(소화불량 0.578, 복통 0.565).
+# 즉 이 경로는 입력 품질이 더 좋아서 조금 낮은 점수도 신뢰할 만하다. 대신 답변은
+# SYMPTOM_RAG_SYSTEM_PROMPT 규칙대로 "~일 가능성이 있습니다"로만 말하고 진료를 권한다.
+
+
+_DISEASE_SUFFIX_RE = re.compile(r"(염|병|증|암|증후군|장애|궤양|결핵|중독|종양)$")
+
+
+def _looks_like_interview_answer(user_question: str) -> bool:
+    """문진 중에 들어온 입력이 "우리 질문에 대한 답변"인지 판단.
+
+    사용자가 병명을 말하면(사전에 있는 병명이거나, 병명 접미사로 끝나는 단어)
+    문진을 접고 평소 파이프라인으로 보낸다. 그 외에는 - 시간("저녁부터"),
+    빈도, 정도, 상황 설명 등 무엇이든 - 우리 질문에 대한 답변으로 본다.
+
+    처음엔 is_name_like_query로 판단했는데, "저녁부터"가 4글자이고 증상 표현도
+    없어서 "병명 같다"로 오판 -> 위키피디아에서 '저녁'을 검색하는 버그가 있었음
+    (2026-10-01). 답변은 병명이 아닌 게 정상이므로, "병명인지"만 좁게 보고
+    나머지는 전부 답변으로 처리하는 쪽이 맞다."""
+    if find_known_term_in_text(user_question):
+        return False
+    return _DISEASE_SUFFIX_RE.search(clean_disease_query(user_question)) is None
+
+
+def _handle_interview_answer(messages: list, user_question: str,
+                             state: MedicalConversationState) -> str | None:
+    """문진 답변을 원래 호소에 누적하고, 모인 설명으로 다시 검색해본다.
+    - 검색 성공 -> 답변하고 문진 종료
+    - 실패 & 아직 더 물어볼 여유 있음 -> 아직 안 물어본 걸 추가 질문
+    - 실패 & 여유 없음 -> 솔직하게 마무리(병원 권유)
+    반환값이 None이면 호출자가 평소 파이프라인을 계속 진행한다."""
+    state.add_interview_answer(user_question)
+    description = state.interview_description()
+    rounds = len(state.followup_answers)
+    print(f"  [문진] 답변 누적({rounds}회): {description}")
+
+    normalized = normalize_symptom_query(description)
+    print(f"  [문진] 검색어 정규화: {normalized}")
+    rag_result = search_symptom_info(normalized, description,
+                                     min_similarity=MIN_SIMILARITY_INTERVIEW)
+
+    if not _is_failure_message(rag_result):
+        print("  [문진] 모인 정보로 건강포털 RAG 성공 -> 문진 종료")
+        answer = (
+            f"말씀해주신 내용({description})을 종합해보면 이런 가능성을 참고해보실 "
+            f"수 있어요.\n\n{rag_result}"
+        )
+        state.record_symptom(description, "문진 완료(증상 종합)")
+        top_match = search_kdca(normalized, top_k=1)
+        if top_match:
+            state.record_disease(top_match[0][0], "search_symptom_info(문진 종합 추정)")
+            state.last_topic = top_match[0][0]
+        state.end_interview()
+        state.awaiting_followup_reply = "?" in answer[-200:]
+        messages.append({"role": "assistant", "content": answer})
+        return answer
+
+    if rounds < MAX_INTERVIEW_ROUNDS:
+        print("  [문진] 아직 정보가 부족 -> 추가 질문")
+        combined = ask_for_more_detail(state.pending_complaint or description,
+                                       state.followup_answers)
+        state.awaiting_followup_reply = True
+        messages.append({"role": "assistant", "content": combined})
+        return combined
+
+    print("  [문진] 충분히 물어봤지만 매칭 실패 -> 솔직하게 마무리")
+    combined = (
+        f"지금까지 말씀해주신 내용({description})만으로는 제가 가진 자료에서 "
+        "어떤 질환인지 좁히기 어려웠어요. 증상이 계속되거나 심해지면 "
+        "가까운 병원에서 진료를 받아보시는 게 좋겠습니다. "
+        "혹시 짐작되는 병명이 있으시면 그 이름으로 다시 물어봐주셔도 돼요."
+    )
+    state.record_symptom(description, "문진 종합(질환 특정 실패)")
+    state.end_interview()
+    state.awaiting_followup_reply = False
+    messages.append({"role": "assistant", "content": combined})
+    return combined
+
+
 def run_agent_turn(messages: list, user_question: str, state: MedicalConversationState) -> str:
     """C단계: messages(대화 원문)와 state(구조화된 요약)를 둘 다 세션 내내 이어받는다.
     도구 선택은 LLM이 아니라 고정된 파이프라인 순서로 결정한다.
@@ -936,12 +1260,36 @@ def run_agent_turn(messages: list, user_question: str, state: MedicalConversatio
     messages.append({"role": "user", "content": user_question})
 
     try:
+        # 0) 문진 중이면(직전에 우리가 증상을 더 물어봤고, 이번 입력이 그 답변이면)
+        # 이 입력을 독립된 질의로 검색하지 않는다. 사용자의 답변은 증상이 아니라
+        # 시간("저녁부터")·빈도·정도일 수 있어서, 그걸 그대로 검색하면 "저녁부터는
+        # 찾지 못했다"는 엉뚱한 답이 나옴(실제 발생). 원래 호소에 누적해서 다룬다.
+        if state.pending_complaint and _looks_like_interview_answer(user_question):
+            answer = _handle_interview_answer(messages, user_question, state)
+            if answer is not None:
+                return answer
+
         search_text, question_text, known_term = resolve_query_with_context(user_question, state)
         parts: list[str] = []
 
         # 1) 건강포털 RAG 먼저 시도 (검색은 search_text로, LLM 질문은 question_text로 - 분리 이유는 resolve_query_with_context 참고)
         rag_result = search_symptom_info(search_text, question_text)
-        if _is_failure_message(rag_result):
+
+        # 사용자가 "특정 병명"을 물었는데 그 병명이 우리 코퍼스에 없으면(known_term이
+        # None인데 질의가 병명 꼴이면), KDCA에서 나온 매칭은 정의상 '다른 질환'이다.
+        # 그걸 그 병명의 답으로 내놓으면 안 된다 - 실제로 "주사피부염일때 어떻게
+        # 해야해?"가 "열상"(0.62, 칼에 베인 상처)으로 매칭돼서 "주사피부염이 생기면
+        # 깨끗한 수건으로 지혈하라"는 날조 답변이 나왔음(2026-10-02). 임계값을 더
+        # 올려서 막으려 하면 당뇨병(0.630)·고혈압(0.627) 같은 정상 조회가 깨지므로,
+        # "물어본 병명과 매칭된 병명이 다르다"는 사실 자체로 판단한다.
+        asked_unknown_disease = (
+            not known_term
+            and is_name_like_query(user_question, clean_disease_query(user_question))
+        )
+        if asked_unknown_disease and not _is_failure_message(rag_result):
+            print("  [파이프라인] 코퍼스에 없는 병명 질문 -> KDCA 매칭(다른 질환) 보류, 외부 소스 우선")
+
+        if _is_failure_message(rag_result) or asked_unknown_disease:
             # 2) 건강포털에서 못 찾았을 때: 위키피디아/PubMed는 "정확한 병명"으로
             # 찾는 도구라서, 병명이 아니라 짧은 증상 호소("속이 매스꺼워")면
             # 외부 검색을 아예 하지 않고 증상을 더 물어본다. 이 판단 없이 검색을
@@ -949,15 +1297,38 @@ def run_agent_turn(messages: list, user_question: str, state: MedicalConversatio
             # 엉뚱한 자료를 답변으로 내놓는 사례가 실제로 있었음(2026-10-01).
             name_candidate = known_term or clean_disease_query(user_question)
             if not is_name_like_query(user_question, name_candidate):
-                print("  [파이프라인] 병명이 아닌 증상 호소로 판단 -> 외부 검색 생략, 증상 더 묻기")
+                print("  [파이프라인] 병명이 아닌 증상 호소로 판단 -> 외부 검색 생략, 문진 시작")
                 combined = ask_for_more_detail(user_question)
-                state.record_symptom(user_question, "증상 호소(추가 정보 요청)")
+                state.record_symptom(user_question, "증상 호소(문진 시작)")
+                state.start_interview(user_question)
                 state.last_topic = None
                 state.awaiting_followup_reply = True
                 messages.append({"role": "assistant", "content": combined})
                 return combined
 
-            print("  [파이프라인] 건강포털 RAG 실패 -> 위키피디아로 대체")
+            # 2-1) 먼저 MedlinePlus(미국 NIH). 위키피디아보다 앞에 두는 이유:
+            # 애초에 건강 주제만 모아둔 DB여서 비의료 문서가 걸릴 일이 없고,
+            # 주제 태그(altTitle)로 병명이 직접 매칭되는지 확인할 수 있어 근거가
+            # 더 분명하다. 대신 영문 DB라 병명 영문 매핑이 안 되면 건너뛴다.
+            print("  [파이프라인] 건강포털 RAG 실패 -> MedlinePlus(NIH) 시도")
+            medline_result = search_medlineplus(known_term or user_question)
+            if not _is_failure_message(medline_result):
+                parts.append(medline_result)
+                recorded = known_term
+                if not recorded:
+                    title_match = re.search(r"\(출처: MedlinePlus '(.+?)'", medline_result)
+                    recorded = title_match.group(1) if title_match else None
+                if recorded:
+                    state.record_disease(recorded, "search_medlineplus")
+                    if not known_term:
+                        state.record_symptom(user_question, f"search_medlineplus(추정: {recorded})")
+                state.last_topic = known_term or state.last_topic
+                combined = "\n\n".join(parts)
+                state.awaiting_followup_reply = "?" in combined[-200:]
+                messages.append({"role": "assistant", "content": combined})
+                return combined
+
+            print("  [파이프라인] MedlinePlus 실패 -> 위키피디아로 대체")
             wiki_result = search_wikipedia(known_term or user_question)
             if not _is_failure_message(wiki_result):
                 parts.append(wiki_result)
@@ -989,6 +1360,22 @@ def run_agent_turn(messages: list, user_question: str, state: MedicalConversatio
                 fallback_keyword = known_term or clean_disease_query(user_question)
                 pubmed_result = search_pubmed_deep(fallback_keyword)
                 if _is_failure_message(pubmed_result):
+                    # 외부 소스가 전부 실패했지만, 코퍼스에 없는 병명을 물어서
+                    # 보류해둔 KDCA 매칭이 있으면 버리지 말고 "직접 자료는 아니다"라고
+                    # 분명히 밝히면서 참고용으로 보여준다(정보를 아예 잃지 않도록).
+                    if asked_unknown_disease and not _is_failure_message(rag_result):
+                        print("  [파이프라인] 외부 소스 전부 실패 -> 보류했던 KDCA 매칭을 참고용으로 안내")
+                        combined = (
+                            f"'{fallback_keyword}'에 대한 직접적인 자료는 제가 가진 "
+                            "건강정보포털·MedlinePlus·위키피디아·PubMed에서 찾지 못했어요. "
+                            "아래는 증상이 비슷해 보이는 다른 질환 자료라서, 여쭤보신 "
+                            "질환과 다를 수 있다는 점을 꼭 감안해주세요.\n\n"
+                            f"{rag_result}"
+                        )
+                        state.record_symptom(user_question, "병명 미확인(유사 질환 참고 안내)")
+                        state.awaiting_followup_reply = "?" in combined[-200:]
+                        messages.append({"role": "assistant", "content": combined})
+                        return combined
                     messages.pop()
                     state.turn -= 1
                     return (

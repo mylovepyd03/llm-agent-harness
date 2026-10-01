@@ -246,7 +246,7 @@ _PAGE = """<!doctype html>
     <div class="logo">🩺</div>
     <div class="titles">
       <h1>내 손안의 의사</h1>
-      <div class="sub"><span class="dot"></span> 국가건강정보포털 · 위키피디아 · PubMed 기반</div>
+      <div class="sub"><span class="dot"></span> 국가건강정보포털 · MedlinePlus(NIH) · 위키피디아 · PubMed 기반</div>
     </div>
     <div class="spacer"></div>
     <button class="ghost" id="summaryBtn" type="button">요약</button>
