@@ -168,35 +168,98 @@ MIN_SIMILARITY_WIKIPEDIA = 0.4
 # 찾아온 뒤 우리 자신의 임베딩으로 "질문과 본문이 실제로 관련 있는지" 한 번 더
 # 검증한다. 실측: 무관한 오검색 0.17~0.28, 정말 관련 있는 검색 0.53~0.71로
 # 뚜렷한 간격이 있어서 0.4로 잡음(KDCA 쪽과 달리 여긴 깔끔하게 갈림).
-def search_wikipedia(query: str) -> str:
-    query = clean_disease_query(query)
+
+
+def _wikipedia_candidate_titles(query: str) -> list[str]:
+    """srsearch 1위 + prefixsearch(제목이 쿼리로 시작하는 문서들)로 후보를
+    모은다. "주사피부염" 같은 합성어는 srsearch만으론 관련 문서를 못 찾는 걸
+    확인함 - 흔한 뜻("주사"=주사기)이 검색 순위에서 이겨버려서, 특이한 뜻의
+    문서(실제로 로사시아는 "주사 (질병)"라는 제목으로 존재함)는 안 뜸.
+    제목이 쿼리의 앞부분으로 시작하는 문서까지 후보로 넓혀서, 아래에서
+    임베딩으로 재선별한다(2026-09-24에 "주사 (질병)" 사례로 발견)."""
+    titles: list[str] = []
+
+    def _add(new_titles):
+        for t in new_titles:
+            if t not in titles:
+                titles.append(t)
+
     search_resp = requests.get(
         "https://ko.wikipedia.org/w/api.php",
         params={"action": "query", "list": "search", "srsearch": query, "format": "json", "srlimit": 1},
         headers=WIKI_HEADERS, timeout=10,
     )
-    results = search_resp.json()["query"]["search"]
-    if not results:
-        return f"'{query}'에 대한 위키피디아 검색 결과가 없습니다."
-    title = results[0]["title"]
+    _add(r["title"] for r in search_resp.json()["query"]["search"])
 
-    extract_resp = requests.get(
+    prefixes = {query}
+    if len(query) > 2:
+        prefixes.add(query[:2])
+    if len(query) > 4:
+        prefixes.add(query[: len(query) // 2])
+
+    for prefix in prefixes:
+        prefix_resp = requests.get(
+            "https://ko.wikipedia.org/w/api.php",
+            params={"action": "query", "list": "prefixsearch", "pssearch": prefix, "format": "json", "pslimit": 8},
+            headers=WIKI_HEADERS, timeout=10,
+        )
+        _add(r["title"] for r in prefix_resp.json()["query"]["prefixsearch"])
+
+    return titles[:10]
+
+
+def _wikipedia_page_info(title: str) -> dict | None:
+    """본문 요약과 영어 langlink(있으면)를 한 번에 가져온다. langlink는 사람이
+    큐레이션한 언어 간 매핑이라, PubMed용 영문 번역에 LLM 추측보다 더 믿을 만함
+    (예: "주사 (질병)" -> 영어 langlink가 정확히 "Rosacea")."""
+    resp = requests.get(
         "https://ko.wikipedia.org/w/api.php",
-        params={"action": "query", "prop": "extracts", "exintro": True, "explaintext": True, "titles": title, "format": "json"},
+        params={"action": "query", "prop": "extracts|langlinks", "exintro": True, "explaintext": True,
+                "lllang": "en", "titles": title, "format": "json"},
         headers=WIKI_HEADERS, timeout=10,
     )
-    pages = extract_resp.json()["query"]["pages"]
-    page = next(iter(pages.values()))
+    page = next(iter(resp.json()["query"]["pages"].values()))
+    if "missing" in page:
+        return None
     extract = page.get("extract", "").strip()
     if not extract:
-        return f"'{query}'에 대한 위키피디아 검색 결과가 없습니다."
+        return None
+    langlinks = page.get("langlinks")
+    en_title = langlinks[0]["*"] if langlinks else None
+    return {"title": page.get("title", title), "extract": extract, "en_title": en_title}
 
-    relevance = cosine_similarity(embed(query), embed(extract[:1000]))
-    if relevance < MIN_SIMILARITY_WIKIPEDIA:
-        print(f"    [경고] 위키피디아 결과 '{title}'가 질문과 무관해 보임(유사도 {relevance:.2f}) - 버림")
-        return f"'{query}'에 대한 위키피디아 검색 결과가 없습니다."
 
-    return f"[위키피디아 - {title}]\n{extract[:1000]}"
+def _best_wikipedia_match(query: str) -> dict | None:
+    """query에 대한 후보 문서들(_wikipedia_candidate_titles)을 모아서, 우리
+    자신의 임베딩으로 실제로 가장 관련 있어 보이는 문서 하나를 고른다. 1위
+    후보도 관련성이 임계값 미만이면 None(= 못 찾음으로 처리)."""
+    candidates = _wikipedia_candidate_titles(query)
+    if not candidates:
+        return None
+    query_vec = embed(query)
+    best, best_score = None, -1.0
+    for title in candidates:
+        info = _wikipedia_page_info(title)
+        if not info:
+            continue
+        score = cosine_similarity(query_vec, embed(info["extract"][:1000]))
+        if score > best_score:
+            best, best_score = info, score
+    if best is None or best_score < MIN_SIMILARITY_WIKIPEDIA:
+        if best is not None:
+            print(f"    [경고] 위키피디아 후보 중 가장 가까운 '{best['title']}'도 무관해 보임"
+                  f"(유사도 {best_score:.2f}) - 버림")
+        return None
+    best["score"] = best_score
+    return best
+
+
+def search_wikipedia(query: str) -> str:
+    query = clean_disease_query(query)
+    match = _best_wikipedia_match(query)
+    if match is None:
+        return f"'{query}'에 대한 위키피디아 검색 결과가 없습니다."
+    return f"[위키피디아 - {match['title']}]\n{match['extract'][:1000]}"
 
 
 def _get_disease_items(keyword: str):
@@ -345,6 +408,14 @@ def _to_english_query(keyword: str) -> str:
     items = _get_disease_items(keyword)
     if items and items[0]["sickEngNm"]:
         return items[0]["sickEngNm"]
+    # HIRA 공식 DB에 없으면, 다음으로 위키피디아의 사람이 큐레이션한 언어 간
+    # 링크를 시도한다 - LLM 번역은 "주사"(주사기 vs 로사시아 옛 한자어) 같은
+    # 중의적 단어를 흔한 뜻으로 오역하는 걸 실제로 확인했음(2026-09-24,
+    # "주사피부염" -> "Intramuscular panniculitis"로 완전히 틀리게 번역됨).
+    # 위키피디아 langlink는 "주사 (질병)" -> "Rosacea"로 정확함.
+    match = _best_wikipedia_match(keyword)
+    if match and match.get("en_title"):
+        return match["en_title"]
     return _translate_term_to_english(keyword)
 
 
