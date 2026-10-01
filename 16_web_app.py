@@ -65,48 +65,114 @@ _PAGE = """<!doctype html>
 <html lang="ko">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>내 손안의 의사</title>
 <style>
-  body { font-family: -apple-system, system-ui, sans-serif; max-width: 720px;
-         margin: 0 auto; padding: 16px; background: #f7f7f8; }
-  h1 { font-size: 1.2rem; }
-  #log { display: flex; flex-direction: column; gap: 10px; margin-bottom: 90px; }
-  .msg { padding: 10px 14px; border-radius: 12px; max-width: 85%; white-space: pre-wrap;
-         line-height: 1.5; }
-  .user { align-self: flex-end; background: #4f7cff; color: white; }
-  .bot  { align-self: flex-start; background: white; border: 1px solid #ddd; }
-  .pending { opacity: 0.6; }
-  form { position: fixed; bottom: 0; left: 0; right: 0; display: flex; gap: 8px;
-         padding: 12px; background: #f7f7f8; border-top: 1px solid #ddd; }
-  input { flex: 1; padding: 10px; border-radius: 8px; border: 1px solid #ccc; font-size: 1rem; }
-  button { padding: 10px 16px; border-radius: 8px; border: none; background: #4f7cff;
-           color: white; font-size: 1rem; cursor: pointer; }
-  button:disabled { opacity: 0.5; }
-  #summaryBtn { background: #888; margin-left: 6px; }
+  :root {
+    --accent: #3b6fe0; --accent-dark: #2f59b8; --bg: #eef1f6; --card: #ffffff;
+    --text: #1f2430; --muted: #8a93a6; --border: #e4e7ee;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo",
+                 "Pretendard", system-ui, sans-serif;
+    margin: 0; background: var(--bg); color: var(--text);
+    display: flex; justify-content: center;
+  }
+  .app {
+    width: 100%; max-width: 720px; min-height: 100vh; background: var(--card);
+    display: flex; flex-direction: column;
+    box-shadow: 0 0 40px rgba(20, 30, 60, 0.06);
+  }
+  header {
+    padding: 18px 20px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 10px;
+    background: linear-gradient(135deg, var(--accent), var(--accent-dark));
+    color: white; position: sticky; top: 0; z-index: 5;
+  }
+  header .icon { font-size: 1.4rem; }
+  header h1 { font-size: 1.05rem; margin: 0; font-weight: 600; }
+  header p { margin: 2px 0 0; font-size: 0.75rem; opacity: 0.85; }
+  header .spacer { flex: 1; }
+  .iconbtn {
+    background: rgba(255,255,255,0.18); border: none; color: white;
+    border-radius: 8px; padding: 7px 11px; font-size: 0.78rem; cursor: pointer;
+  }
+  .iconbtn:hover { background: rgba(255,255,255,0.3); }
+  #log { flex: 1; display: flex; flex-direction: column; gap: 12px;
+         padding: 18px 16px 100px; overflow-y: auto; }
+  .empty-hint { margin: auto; text-align: center; color: var(--muted); font-size: 0.88rem; }
+  .row { display: flex; gap: 8px; max-width: 88%; }
+  .row.user { align-self: flex-end; flex-direction: row-reverse; }
+  .row.bot { align-self: flex-start; }
+  .avatar { flex-shrink: 0; width: 28px; height: 28px; border-radius: 50%;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 0.95rem; background: var(--bg); }
+  .msg { padding: 11px 15px; border-radius: 16px; white-space: pre-wrap;
+         line-height: 1.55; font-size: 0.93rem; }
+  .row.user .msg { background: var(--accent); color: white; border-bottom-right-radius: 4px; }
+  .row.bot .msg { background: #f3f5f9; color: var(--text); border-bottom-left-radius: 4px; }
+  .row.pending .msg { color: var(--muted); font-style: italic; }
+  form {
+    position: fixed; bottom: 0; left: 50%; transform: translateX(-50%);
+    width: 100%; max-width: 720px; display: flex; gap: 8px;
+    padding: 12px 14px calc(12px + env(safe-area-inset-bottom));
+    background: var(--card); border-top: 1px solid var(--border);
+  }
+  input {
+    flex: 1; padding: 11px 14px; border-radius: 22px; border: 1px solid var(--border);
+    font-size: 0.93rem; background: var(--bg); color: var(--text); outline: none;
+  }
+  input:focus { border-color: var(--accent); }
+  button[type=submit] {
+    padding: 0 18px; border-radius: 22px; border: none; background: var(--accent);
+    color: white; font-size: 0.9rem; font-weight: 600; cursor: pointer;
+  }
+  button[type=submit]:hover { background: var(--accent-dark); }
+  button:disabled { opacity: 0.5; cursor: default; }
 </style>
 </head>
 <body>
-<h1>내 손안의 의사</h1>
-<div id="log"></div>
-<form id="form">
-  <input id="input" autocomplete="off" placeholder="증상이나 궁금한 병명을 물어보세요">
-  <button id="sendBtn" type="submit">보내기</button>
-  <button id="summaryBtn" type="button">요약</button>
-  <button id="resetBtn" type="button">새 대화</button>
-</form>
+<div class="app">
+  <header>
+    <span class="icon">🩺</span>
+    <div>
+      <h1>내 손안의 의사</h1>
+      <p>증상/병명을 물어보면 찾아서 알려드려요</p>
+    </div>
+    <div class="spacer"></div>
+    <button class="iconbtn" id="summaryBtn" type="button">요약</button>
+    <button class="iconbtn" id="resetBtn" type="button">새 대화</button>
+  </header>
+  <div id="log"><div class="empty-hint">예: "위염이 뭐야?", "머리가 아프고 속이 메스꺼워요"</div></div>
+  <form id="form">
+    <input id="input" autocomplete="off" placeholder="증상이나 궁금한 병명을 물어보세요">
+    <button id="sendBtn" type="submit">보내기</button>
+  </form>
+</div>
 <script>
 const log = document.getElementById('log');
 const form = document.getElementById('form');
 const input = document.getElementById('input');
 const sendBtn = document.getElementById('sendBtn');
 
-function addMsg(text, who) {
-  const div = document.createElement('div');
-  div.className = 'msg ' + who;
-  div.textContent = text;
-  log.appendChild(div);
-  window.scrollTo(0, document.body.scrollHeight);
-  return div;
+const emptyHint = log.querySelector('.empty-hint');
+
+function addMsg(text, who, pending) {
+  if (emptyHint) emptyHint.remove();
+  const row = document.createElement('div');
+  row.className = 'row ' + who + (pending ? ' pending' : '');
+  const avatar = document.createElement('div');
+  avatar.className = 'avatar';
+  avatar.textContent = who === 'user' ? '🙂' : '🩺';
+  const bubble = document.createElement('div');
+  bubble.className = 'msg';
+  bubble.textContent = text;
+  row.appendChild(avatar);
+  row.appendChild(bubble);
+  log.appendChild(row);
+  log.scrollTop = log.scrollHeight;
+  return row;
 }
 
 form.addEventListener('submit', async (e) => {
@@ -116,7 +182,7 @@ form.addEventListener('submit', async (e) => {
   addMsg(question, 'user');
   input.value = '';
   sendBtn.disabled = true;
-  const pending = addMsg('생각하는 중... (검색 내용에 따라 수십 초 걸릴 수 있어요)', 'bot pending');
+  const pending = addMsg('생각하는 중... (검색 내용에 따라 수십 초 걸릴 수 있어요)', 'bot', true);
   try {
     const resp = await fetch('/api/chat', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -142,7 +208,7 @@ document.getElementById('summaryBtn').addEventListener('click', async () => {
 
 document.getElementById('resetBtn').addEventListener('click', async () => {
   await fetch('/api/reset', {method: 'POST'});
-  log.innerHTML = '';
+  log.innerHTML = '<div class="empty-hint">예: "위염이 뭐야?", "머리가 아프고 속이 메스꺼워요"</div>';
 });
 </script>
 </body>
