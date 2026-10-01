@@ -28,10 +28,11 @@ LLM 기반 에이전트/하네스 시스템을 구현해보는 개인 학습 프
     낮아서 교체함
   - 확인: `curl http://localhost:11434/api/version`
 - 파이썬: conda base 환경 사용 (`/opt/anaconda3/bin/python`)
+- 웹 UI(`16_web_app.py`): `fastapi`, `uvicorn` 필요 (`pip install fastapi uvicorn`)
 - API 키: `.env` 파일에 보관 (git에 안 올라감, `.gitignore` 처리됨)
   - `DISEASE_INFO_SERVICE_KEY`: 공공데이터포털 건강보험심사평가원 질병정보서비스
   - `KDCA_HEALTH_INFO_TOKEN`: 질병관리청 국가건강정보포털
-- git: 로컬 저장소 + GitHub 비공개 저장소(`mylovepyd03/llm-agent-harness`) 연결됨
+- git: 로컬 저장소 + GitHub 저장소(`mylovepyd03/llm-agent-harness`, 2026-09-22부터 공개) 연결됨
 
 ## 로드맵
 
@@ -382,6 +383,27 @@ messages(대화 원문)에 추가 → 화면에 출력
   치료법 다 포함)**을 찾아서 답변함. "위염이 뭐야?" 등 기존 케이스 회귀 없음도
   재확인. 이로써 "알려진 한계"에 남아있던 어휘 중의성 문제 해결됨
 
+### 2026-10-01 (계속) — 웹 UI 추가 (`16_web_app.py`)
+사용자가 "우리가 설계한 걸 웹/앱 플랫폼으로 만들 수 있나?"라고 물어봄 — llama3.1이
+로컬 Ollama에서만 돌아가서 "아무나 인터넷에서 접속하는 공개 서비스"는 서버 비용이
+드는 큰 결정이라, 우선 "로컬에서 브라우저로 쓰는 웹 UI"부터 만들기로 함.
+- FastAPI + uvicorn 설치, `16_web_app.py` 신설. **에이전트 로직은 한 줄도
+  새로 안 만들고 `14_integrated_agent.py`를 모듈로 그대로 불러와서 재사용**
+  (파일명이 숫자로 시작해 일반 import가 안 돼서 importlib 사용 - 지금까지
+  테스트 스크립트에서 쓰던 방식과 동일)
+- `POST /api/chat`(질문→답변), `GET /api/summary`(state 요약), `POST /api/reset`
+  3개 엔드포인트 + 간단한 채팅 UI(HTML/CSS/JS를 파이썬 문자열로 내장, 별도
+  프론트엔드 빌드 없음)
+- 지금 버전은 세션 구분이 없는 가장 단순한 형태 - 서버 전역에 대화 상태
+  (messages/state) 하나만 존재. "나 혼자 로컬에서 쓰는 웹 UI"를 전제로 한
+  의도적 설계이고, 멀티유저 지원은 다음 과제로 남김
+- `curl`로 `/`(페이지 로드), `/api/chat`("위염이 뭐야?" 질문→정상 답변),
+  `/api/summary`(state 반영 확인) 전부 실제로 서버를 띄워서 검증함
+- 실행: `/opt/anaconda3/bin/python -m uvicorn 16_web_app:app --reload` 후
+  브라우저에서 `http://localhost:8000` 접속. 이렇게 하면 "알려진 한계"에 있던
+  "Claude Code 채팅 환경 안에서는 대화형 CLI가 안 됨" 문제도 같이 해결됨
+  (별도 터미널 앱 없이 브라우저로 바로 멀티턴 대화 가능)
+
 ## 파일 구성
 
 ### A단계 — 기초 도구 호출 에이전트
@@ -413,6 +435,7 @@ messages(대화 원문)에 추가 → 화면에 출력
 |---|---|
 | `14_integrated_agent.py` | A+B 통합 + 멀티턴 대화 + Medical Conversation State + 결정론적 파이프라인. **지금 실제로 쓰는 파일** |
 | `15_patch_missing_corpus.py` | KDCA API가 본문을 안 채워둔 13개 질환을 위키피디아로 보충하는 1회성 스크립트 |
+| `16_web_app.py` | `14_integrated_agent.py`를 그대로 불러와서 쓰는 FastAPI 웹 UI (브라우저 채팅) |
 
 ### 데이터
 
@@ -470,6 +493,13 @@ LLM 혼자는 못 믿어서 코드로 감싼 부분들 (도구 선택이 결정�
 
 - 대화형 CLI(`14_integrated_agent.py`)는 Claude Code 채팅 환경 안에서 실시간 입력이
   안 됨 — 별도 macOS 터미널 앱에서 직접 실행해야 진짜 대화형으로 써짐
+  (2026-10-01: `16_web_app.py`로 브라우저에서 쓸 수 있는 대안이 생김)
+- `16_web_app.py`는 세션 구분이 없는 가장 단순한 버전 — 서버 전역에 대화
+  상태(messages/state)가 하나뿐이라, 여러 사람이 동시에 쓰면 대화가 서로
+  섞임. 지금은 "나 혼자 로컬에서 쓰는 웹 UI"를 전제로 한 것이고, 여러 사용자를
+  지원하려면 세션/쿠키 기반으로 상태를 분리해야 함
+- 지금은 로컬(`localhost`)에서만 접속 가능 — 공개 웹 서비스로 만들려면 llama3.1을
+  돌릴 서버(비용/GPU 필요)를 별도로 구해야 함
 - 프롬프트로 "지어내지 말라"고 지시해도 완전히는 안 지켜지는 경우가 반복 관찰됨
   (가짜 인용문헌, 가짜 약물명, 무관한 용어 섞임 등) — PubMed 연도 인용은 규칙
   기반 검증을 추가했지만, 이건 "연도"라는 좁은 형태만 잡아내는 것이라 다른 형태의
