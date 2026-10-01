@@ -300,15 +300,68 @@ def _hedge_wikipedia_answer(query: str, title: str, extract: str) -> str:
     return message["content"]
 
 
+MIN_MEDICAL_RELEVANCE = 0.5
+# 위키피디아는 의료 백과사전이 아니라서, 질문과 단어가 겹치기만 하면 만화 제목
+# ("배가본드")이나 인물("나혜석")처럼 의료와 전혀 상관없는 문서도 올라온다.
+# "질문과 관련 있는가"(MIN_SIMILARITY_WIKIPEDIA)와 "애초에 의료/건강 내용인가"는
+# 다른 질문이라, 후자를 따로 검사한다 - 이미 갖고 있는 KDCA 질환 코퍼스(624개)와
+# 비교해서 그 중 하나라도 비슷하면 의료 영역 내용으로 본다.
+# 실측(2026-10-01): 의료 아님 - 배가본드(만화) 0.371, 나혜석(인물) 0.387,
+# 배가사리(어류) 0.465 / 의료 - 주사(질병) 0.612, 쇼그렌증후군 0.662,
+# 피부염 0.816. 그 사이가 뚜렷하게 비어서 0.5로 잡음(해부학 문서는 배가로근
+# 0.541, 머리 0.594로 통과하지만, 이건 질문 관련도가 낮아서 어차피 되묻기
+# 경로로 빠지므로 원문이 그대로 노출되진 않음).
+
+
+def _is_medical_content(text: str) -> bool:
+    """이 텍스트가 의료/건강 영역 내용인지 KDCA 질환 코퍼스와 비교해서 판단."""
+    vec = embed(text[:1000])
+    best = max(cosine_similarity(vec, entry["embedding"]) for entry in KDCA_CORPUS.values())
+    return best >= MIN_MEDICAL_RELEVANCE
+
+
+WIKI_SUMMARY_SYSTEM_PROMPT = (
+    "당신은 위키피디아 자료를 바탕으로 답하는 친절한 건강정보 도우미입니다.\n"
+    "반드시 아래 [참고자료]에 있는 내용만 근거로, 사용자 질문에 맞게 요약해서 "
+    "설명하세요. 참고자료에 없는 내용은 절대 지어내지 마세요.\n"
+    "백과사전 문장을 그대로 옮기지 말고, 사용자가 읽기 쉬운 말로 풀어서 "
+    "정리하세요(어려운 용어는 괄호로 짧게 풀어주면 좋습니다).\n"
+    "구체적인 약물 이름은 나열하지 말고, 필요하면 '약물치료' 정도로만 언급하세요.\n"
+    "이건 진단이 아니라 참고 정보이므로 단정하지 말고, 증상이 지속되면 병원 진료를 "
+    "권하세요.\n"
+    "답변 끝에는 증상을 좁히는 데 도움될 후속 질문을 하나 자연스럽게 덧붙이세요.\n"
+    "질문 문장을 그대로 되풀이하지 말고, 바로 본론부터 4~6문장 정도로 답하세요."
+)
+
+
+def _summarize_wikipedia_answer(query: str, title: str, extract: str) -> str:
+    """위키피디아 원문을 그대로 쏟아내지 않고, 질문에 맞게 요약해서 답한다.
+    KDCA RAG(search_symptom_info)는 이미 이렇게 동작하는데 위키피디아 폴백만
+    원문을 그대로 반환하고 있었어서, 같은 방식으로 맞춘 것. 요약 실패 시에는
+    안전하게 원문을 그대로 돌려준다(정보를 아예 잃지 않도록)."""
+    messages = [
+        {"role": "system", "content": WIKI_SUMMARY_SYSTEM_PROMPT},
+        {"role": "user", "content": f"[참고자료 - {title}]\n{extract[:1500]}\n\n[질문]\n{query}"},
+    ]
+    message = call_with_retry(messages, model=RAG_MODEL, num_predict=1024)
+    if message is None:
+        print("    [경고] 위키피디아 요약 실패 - 원문 그대로 사용")
+        return f"[위키피디아 - {title}]\n{extract[:1000]}"
+    return f"{message['content']}\n\n(출처: 위키피디아 '{title}')"
+
+
 def search_wikipedia(query: str) -> str:
     query = clean_disease_query(query)
     match = _best_wikipedia_match(query)
     if match is None:
         return f"'{query}'에 대한 위키피디아 검색 결과가 없습니다."
+    if not _is_medical_content(match["extract"]):
+        print(f"    [경고] 위키피디아 결과 '{match['title']}'가 의료/건강 내용이 아님 - 버림")
+        return f"'{query}'에 대한 위키피디아 검색 결과가 없습니다."
     if match["score"] < CONFIDENT_SIMILARITY_WIKIPEDIA:
         print(f"    [경고] 위키피디아 매칭이 애매함('{match['title']}', 유사도 {match['score']:.2f}) - 되묻는 답으로 전환")
         return _hedge_wikipedia_answer(query, match["title"], match["extract"])
-    return f"[위키피디아 - {match['title']}]\n{match['extract'][:1000]}"
+    return _summarize_wikipedia_answer(query, match["title"], match["extract"])
 
 
 def _get_disease_items(keyword: str):
@@ -688,7 +741,9 @@ class MedicalConversationState:
                 times = f"{info['count']}번" if info["count"] > 1 else "1번"
                 lines.append(f"- {name} ({times} 언급, 출처: {', '.join(info['sources'])})")
         if self.symptoms:
-            lines.append("\n[언급된 증상]")
+            if lines:
+                lines.append("")
+            lines.append("[언급된 증상]")
             for s in self.symptoms:
                 lines.append(f"- {s['text']} (출처: {s['source']})")
         return "\n".join(lines)
@@ -798,6 +853,60 @@ def resolve_query_with_context(user_question: str, state: MedicalConversationSta
     return user_question, user_question, None
 
 
+# 증상을 호소하는 표현들. 이 표현이 들어있으면 "병명"이 아니라 "증상 서술"로 본다.
+# 왜 필요한가: clean_disease_query는 조사를 떼어내다 보니 "속이 매스꺼워" -> "속",
+# "배가 살살 아파" -> "배"처럼 1글자 조각을 만들어내는데, 그 조각으로 위키피디아를
+# 검색하면 "속옷", "배(과일/선박)" 같은 전혀 다른 문서가 나오고, 심지어 그걸
+# 길게 요약해서 답하는 일이 실제로 발생함(2026-10-01 실측). 위키피디아/PubMed는
+# "정확한 병명"으로 찾을 때만 쓸모가 있는 도구라서, 병명이 아닌 질의로는 아예
+# 호출하지 않고 대신 증상을 더 물어본다.
+_SYMPTOM_COMPLAINT_RE = re.compile(
+    "아프|아파|쑤시|쑤셔|결리|결려|뻐근|저리|저려|메스꺼|매스꺼|메슥|울렁|구역|토할|"
+    "띵|어지럽|어지러|답답|거북|쓰리|쓰려|쓰림|간지럽|가렵|부었|부어|따갑|화끈|"
+    "열나|열이 나|불편해|이상해|힘들어|피곤해"
+)
+MIN_NAME_CANDIDATE_CHARS = 3
+
+
+def is_name_like_query(user_question: str, candidate: str) -> bool:
+    """위키피디아/PubMed(정확한 병명으로 찾는 도구)에 넘길 만한 질의인지 판단.
+    1) 병명 후보가 너무 짧으면(2글자 이하) 조사만 떼어낸 조각일 가능성이 높고,
+    2) 증상 호소 표현이 들어있으면 병명이 아니라 증상 서술이므로 둘 다 거른다."""
+    if len(candidate.strip()) < MIN_NAME_CANDIDATE_CHARS:
+        return False
+    return _SYMPTOM_COMPLAINT_RE.search(user_question) is None
+
+
+CLARIFY_SYSTEM_PROMPT = (
+    "당신은 환자의 증상을 차근차근 물어보는 친절한 건강 상담 도우미입니다.\n"
+    "사용자가 증상을 아주 짧게만 말해서, 아직 어떤 질환인지 추측할 정보가 "
+    "부족한 상황입니다.\n"
+    "**절대 질환명을 추측하거나 원인을 단정하지 마세요.** 아는 척하지 말고, "
+    "자료에 없는 설명을 덧붙이지도 마세요.\n"
+    "사용자가 말한 증상 표현을 자연스럽게 받아서, 진단에 도움이 될 내용을 2~3가지만 "
+    "구체적으로 물어보세요(그 증상에 실제로 맞는 질문이어야 합니다 - 예: 언제부터인지, "
+    "어떤 느낌/정도인지, 같이 나타나는 다른 증상, 식사·수면·활동과의 관계 등).\n"
+    "전체 3문장 이내로 짧고 따뜻하게 답하세요."
+)
+
+
+def ask_for_more_detail(user_question: str) -> str:
+    """병명이 아니라 짧은 증상 호소일 때, 엉뚱한 검색 결과를 들이대는 대신
+    증상을 더 물어본다. 고정 문구가 아니라 LLM이 그 증상에 맞는 질문을 하도록 함."""
+    messages = [
+        {"role": "system", "content": CLARIFY_SYSTEM_PROMPT},
+        {"role": "user", "content": user_question},
+    ]
+    message = call_with_retry(messages, model=RAG_MODEL, num_predict=400)
+    if message is None:
+        return (
+            "증상을 조금 더 자세히 알려주시면 관련 정보를 찾아드릴 수 있어요. "
+            "언제부터 그러셨는지, 어떤 느낌인지, 같이 나타나는 다른 증상은 없는지 "
+            "말씀해주시겠어요?"
+        )
+    return message["content"]
+
+
 def _is_failure_message(text: str) -> bool:
     # 도구들이 반환하는 실패 메시지는 전부 "[오류]"로 시작하거나 아래 문구 중
     # 하나를 포함하도록 맞춰 왔는데, 새 실패 메시지를 추가할 때마다 여기 목록에
@@ -833,7 +942,21 @@ def run_agent_turn(messages: list, user_question: str, state: MedicalConversatio
         # 1) 건강포털 RAG 먼저 시도 (검색은 search_text로, LLM 질문은 question_text로 - 분리 이유는 resolve_query_with_context 참고)
         rag_result = search_symptom_info(search_text, question_text)
         if _is_failure_message(rag_result):
-            # 2) 실패하면 위키피디아로 대체 (아까 "위염"처럼 KDCA에 내용이 비어있는 경우 등)
+            # 2) 건강포털에서 못 찾았을 때: 위키피디아/PubMed는 "정확한 병명"으로
+            # 찾는 도구라서, 병명이 아니라 짧은 증상 호소("속이 매스꺼워")면
+            # 외부 검색을 아예 하지 않고 증상을 더 물어본다. 이 판단 없이 검색을
+            # 돌렸다가 "속" -> "속옷" 문서, "배" -> PubMed 정신건강 논문처럼
+            # 엉뚱한 자료를 답변으로 내놓는 사례가 실제로 있었음(2026-10-01).
+            name_candidate = known_term or clean_disease_query(user_question)
+            if not is_name_like_query(user_question, name_candidate):
+                print("  [파이프라인] 병명이 아닌 증상 호소로 판단 -> 외부 검색 생략, 증상 더 묻기")
+                combined = ask_for_more_detail(user_question)
+                state.record_symptom(user_question, "증상 호소(추가 정보 요청)")
+                state.last_topic = None
+                state.awaiting_followup_reply = True
+                messages.append({"role": "assistant", "content": combined})
+                return combined
+
             print("  [파이프라인] 건강포털 RAG 실패 -> 위키피디아로 대체")
             wiki_result = search_wikipedia(known_term or user_question)
             if not _is_failure_message(wiki_result):
@@ -846,7 +969,13 @@ def run_agent_turn(messages: list, user_question: str, state: MedicalConversatio
                     # 서술 자체는 "증상"으로, 매칭된 병명은 "추정 질환"으로 같이 남긴다 -
                     # 여러 턴에 걸쳐 증상이 쌓이고 같은 질환이 후보로 반복되면 문진처럼
                     # 좁혀지는 걸 state.summary()에서 볼 수 있게 하기 위함.
-                    title_match = re.match(r"\[위키피디아 - (.+?)\]", wiki_result)
+                    # 위키 답변 형식 두 가지를 모두 지원: 요약 실패 시 원문 그대로
+                    # 반환하는 "[위키피디아 - 제목]\n..." 형식과, 요약 성공 시
+                    # 끝에 붙는 "(출처: 위키피디아 '제목')" 형식.
+                    title_match = (
+                        re.match(r"\[위키피디아 - (.+?)\]", wiki_result)
+                        or re.search(r"\(출처: 위키피디아 '(.+?)'\)", wiki_result)
+                    )
                     if title_match:
                         matched_name = title_match.group(1)
                         state.record_symptom(user_question, f"search_wikipedia(fallback, 추정: {matched_name})")

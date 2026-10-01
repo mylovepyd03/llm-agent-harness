@@ -69,85 +69,195 @@ _PAGE = """<!doctype html>
 <title>내 손안의 의사</title>
 <style>
   :root {
-    --accent: #3b6fe0; --accent-dark: #2f59b8; --bg: #eef1f6; --card: #ffffff;
-    --text: #1f2430; --muted: #8a93a6; --border: #e4e7ee;
+    --teal: #0f9b8e;
+    --teal-dark: #0a7d72;
+    --teal-soft: #e6f6f4;
+    --ink: #17212b;
+    --muted: #7b8794;
+    --line: #e8edf2;
+    --card: #ffffff;
   }
-  * { box-sizing: border-box; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
   body {
+    margin: 0; min-height: 100vh;
     font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo",
-                 "Pretendard", system-ui, sans-serif;
-    margin: 0; background: var(--bg); color: var(--text);
-    display: flex; justify-content: center;
+                 Pretendard, "Noto Sans KR", system-ui, sans-serif;
+    color: var(--ink);
+    background:
+      radial-gradient(900px 500px at 12% -5%, #d9f1ee 0%, transparent 60%),
+      radial-gradient(800px 500px at 95% 8%, #e4ecfb 0%, transparent 55%),
+      linear-gradient(180deg, #f6f9fb 0%, #eef3f7 100%);
+    background-attachment: fixed;
+    display: flex; justify-content: center; align-items: stretch;
   }
+
   .app {
-    width: 100%; max-width: 720px; min-height: 100vh; background: var(--card);
-    display: flex; flex-direction: column;
-    box-shadow: 0 0 40px rgba(20, 30, 60, 0.06);
+    width: 100%; max-width: 760px; display: flex; flex-direction: column;
+    min-height: 100vh; background: rgba(255,255,255,0.72);
+    backdrop-filter: blur(12px);
+    border-left: 1px solid rgba(255,255,255,0.7);
+    border-right: 1px solid rgba(255,255,255,0.7);
+    box-shadow: 0 10px 60px rgba(23, 45, 70, 0.10);
   }
+
+  /* ── 헤더 ───────────────────────────────── */
   header {
-    padding: 18px 20px; border-bottom: 1px solid var(--border);
-    display: flex; align-items: center; gap: 10px;
-    background: linear-gradient(135deg, var(--accent), var(--accent-dark));
-    color: white; position: sticky; top: 0; z-index: 5;
+    position: sticky; top: 0; z-index: 10;
+    display: flex; align-items: center; gap: 12px;
+    padding: 16px 20px;
+    background: linear-gradient(135deg, var(--teal) 0%, #11867f 55%, #0e6f82 100%);
+    color: #fff;
+    box-shadow: 0 6px 24px rgba(13, 120, 110, 0.22);
   }
-  header .icon { font-size: 1.4rem; }
-  header h1 { font-size: 1.05rem; margin: 0; font-weight: 600; }
-  header p { margin: 2px 0 0; font-size: 0.75rem; opacity: 0.85; }
-  header .spacer { flex: 1; }
-  .iconbtn {
-    background: rgba(255,255,255,0.18); border: none; color: white;
-    border-radius: 8px; padding: 7px 11px; font-size: 0.78rem; cursor: pointer;
+  .logo {
+    width: 40px; height: 40px; flex-shrink: 0; border-radius: 13px;
+    display: grid; place-items: center; font-size: 1.25rem;
+    background: rgba(255,255,255,0.2);
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,0.28);
   }
-  .iconbtn:hover { background: rgba(255,255,255,0.3); }
-  #log { flex: 1; display: flex; flex-direction: column; gap: 12px;
-         padding: 18px 16px 100px; overflow-y: auto; }
-  .empty-hint { margin: auto; text-align: center; color: var(--muted); font-size: 0.88rem; }
-  .row { display: flex; gap: 8px; max-width: 88%; }
+  .titles h1 { margin: 0; font-size: 1.02rem; font-weight: 700; letter-spacing: -0.2px; }
+  .titles .sub {
+    margin: 3px 0 0; font-size: 0.72rem; opacity: 0.9;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .dot {
+    width: 6px; height: 6px; border-radius: 50%; background: #7dffb2;
+    box-shadow: 0 0 0 0 rgba(125,255,178,0.8); animation: pulse 2.2s infinite;
+  }
+  @keyframes pulse {
+    0%   { box-shadow: 0 0 0 0 rgba(125,255,178,0.7); }
+    70%  { box-shadow: 0 0 0 7px rgba(125,255,178,0); }
+    100% { box-shadow: 0 0 0 0 rgba(125,255,178,0); }
+  }
+  .spacer { flex: 1; }
+  .ghost {
+    background: rgba(255,255,255,0.16); border: 1px solid rgba(255,255,255,0.22);
+    color: #fff; border-radius: 10px; padding: 7px 12px;
+    font-size: 0.76rem; font-weight: 600; cursor: pointer;
+    transition: background 0.18s ease, transform 0.12s ease;
+  }
+  .ghost:hover { background: rgba(255,255,255,0.3); }
+  .ghost:active { transform: scale(0.96); }
+
+  /* ── 대화 영역 ──────────────────────────── */
+  #log {
+    flex: 1; display: flex; flex-direction: column; gap: 14px;
+    padding: 24px 18px 132px; overflow-y: auto; scroll-behavior: smooth;
+  }
+  #log::-webkit-scrollbar { width: 8px; }
+  #log::-webkit-scrollbar-thumb { background: #d4dde6; border-radius: 99px; }
+
+  .welcome { margin: auto 0; text-align: center; padding: 10px; }
+  .welcome .big { font-size: 2.6rem; }
+  .welcome h2 { margin: 10px 0 6px; font-size: 1.1rem; font-weight: 700; }
+  .welcome p { margin: 0 0 18px; font-size: 0.86rem; color: var(--muted); line-height: 1.6; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
+  .chip {
+    background: var(--card); border: 1px solid var(--line); color: var(--teal-dark);
+    border-radius: 999px; padding: 9px 15px; font-size: 0.82rem; font-weight: 600;
+    cursor: pointer; transition: all 0.18s ease;
+    box-shadow: 0 2px 8px rgba(23, 45, 70, 0.05);
+  }
+  .chip:hover { background: var(--teal-soft); border-color: #bfe6e1; transform: translateY(-1px); }
+
+  .row { display: flex; gap: 9px; max-width: 86%; animation: rise 0.3s ease both; }
   .row.user { align-self: flex-end; flex-direction: row-reverse; }
   .row.bot { align-self: flex-start; }
-  .avatar { flex-shrink: 0; width: 28px; height: 28px; border-radius: 50%;
-            display: flex; align-items: center; justify-content: center;
-            font-size: 0.95rem; background: var(--bg); }
-  .msg { padding: 11px 15px; border-radius: 16px; white-space: pre-wrap;
-         line-height: 1.55; font-size: 0.93rem; }
-  .row.user .msg { background: var(--accent); color: white; border-bottom-right-radius: 4px; }
-  .row.bot .msg { background: #f3f5f9; color: var(--text); border-bottom-left-radius: 4px; }
-  .row.pending .msg { color: var(--muted); font-style: italic; }
+  @keyframes rise {
+    from { opacity: 0; transform: translateY(8px); }
+    to   { opacity: 1; transform: none; }
+  }
+  .avatar {
+    flex-shrink: 0; width: 30px; height: 30px; border-radius: 50%;
+    display: grid; place-items: center; font-size: 0.92rem;
+    background: var(--card); box-shadow: 0 2px 7px rgba(23,45,70,0.09);
+  }
+  .row.bot .avatar { background: var(--teal-soft); }
+  .msg {
+    padding: 12px 16px; border-radius: 18px; white-space: pre-wrap;
+    line-height: 1.62; font-size: 0.93rem; word-break: break-word;
+    box-shadow: 0 2px 10px rgba(23, 45, 70, 0.06);
+  }
+  .row.user .msg {
+    background: linear-gradient(135deg, var(--teal) 0%, var(--teal-dark) 100%);
+    color: #fff; border-bottom-right-radius: 5px;
+  }
+  .row.bot .msg {
+    background: var(--card); color: var(--ink);
+    border: 1px solid var(--line); border-bottom-left-radius: 5px;
+  }
+
+  /* 타이핑 인디케이터 */
+  .typing { display: flex; gap: 4px; padding: 4px 2px; }
+  .typing i {
+    width: 7px; height: 7px; border-radius: 50%; background: #b6c2cd;
+    animation: blink 1.3s infinite ease-in-out;
+  }
+  .typing i:nth-child(2) { animation-delay: 0.18s; }
+  .typing i:nth-child(3) { animation-delay: 0.36s; }
+  @keyframes blink {
+    0%, 80%, 100% { opacity: 0.3; transform: translateY(0); }
+    40%           { opacity: 1;   transform: translateY(-3px); }
+  }
+  .hint-text { font-size: 0.76rem; color: var(--muted); margin-top: 5px; }
+
+  /* ── 입력창 ─────────────────────────────── */
   form {
     position: fixed; bottom: 0; left: 50%; transform: translateX(-50%);
-    width: 100%; max-width: 720px; display: flex; gap: 8px;
-    padding: 12px 14px calc(12px + env(safe-area-inset-bottom));
-    background: var(--card); border-top: 1px solid var(--border);
+    width: 100%; max-width: 760px; display: flex; gap: 9px; align-items: center;
+    padding: 14px 16px calc(16px + env(safe-area-inset-bottom));
+    background: linear-gradient(180deg, rgba(246,249,251,0) 0%, rgba(246,249,251,0.95) 38%, #f6f9fb 100%);
   }
   input {
-    flex: 1; padding: 11px 14px; border-radius: 22px; border: 1px solid var(--border);
-    font-size: 0.93rem; background: var(--bg); color: var(--text); outline: none;
+    flex: 1; padding: 14px 18px; border-radius: 999px;
+    border: 1px solid var(--line); background: var(--card);
+    font-size: 0.94rem; color: var(--ink); outline: none;
+    box-shadow: 0 4px 18px rgba(23, 45, 70, 0.07);
+    transition: border-color 0.18s ease, box-shadow 0.18s ease;
   }
-  input:focus { border-color: var(--accent); }
-  button[type=submit] {
-    padding: 0 18px; border-radius: 22px; border: none; background: var(--accent);
-    color: white; font-size: 0.9rem; font-weight: 600; cursor: pointer;
+  input::placeholder { color: #a9b4bf; }
+  input:focus {
+    border-color: var(--teal);
+    box-shadow: 0 0 0 3px rgba(15,155,142,0.14), 0 4px 18px rgba(23,45,70,0.07);
   }
-  button[type=submit]:hover { background: var(--accent-dark); }
-  button:disabled { opacity: 0.5; cursor: default; }
+  .send {
+    width: 48px; height: 48px; flex-shrink: 0; border: none; border-radius: 50%;
+    background: linear-gradient(135deg, var(--teal) 0%, var(--teal-dark) 100%);
+    color: #fff; font-size: 1.1rem; cursor: pointer;
+    display: grid; place-items: center;
+    box-shadow: 0 6px 18px rgba(15, 155, 142, 0.34);
+    transition: transform 0.14s ease, box-shadow 0.18s ease;
+  }
+  .send:hover { transform: translateY(-1px); box-shadow: 0 9px 22px rgba(15,155,142,0.4); }
+  .send:active { transform: scale(0.94); }
+  .send:disabled { opacity: 0.45; cursor: default; transform: none; box-shadow: none; }
+
+  @media (max-width: 480px) {
+    #log { padding: 18px 13px 126px; }
+    .row { max-width: 92%; }
+    .titles .sub { display: none; }
+  }
 </style>
 </head>
 <body>
 <div class="app">
   <header>
-    <span class="icon">🩺</span>
-    <div>
+    <div class="logo">🩺</div>
+    <div class="titles">
       <h1>내 손안의 의사</h1>
-      <p>증상/병명을 물어보면 찾아서 알려드려요</p>
+      <div class="sub"><span class="dot"></span> 국가건강정보포털 · 위키피디아 · PubMed 기반</div>
     </div>
     <div class="spacer"></div>
-    <button class="iconbtn" id="summaryBtn" type="button">요약</button>
-    <button class="iconbtn" id="resetBtn" type="button">새 대화</button>
+    <button class="ghost" id="summaryBtn" type="button">요약</button>
+    <button class="ghost" id="resetBtn" type="button">새 대화</button>
   </header>
-  <div id="log"><div class="empty-hint">예: "위염이 뭐야?", "머리가 아프고 속이 메스꺼워요"</div></div>
+
+  <div id="log"></div>
+
   <form id="form">
-    <input id="input" autocomplete="off" placeholder="증상이나 궁금한 병명을 물어보세요">
-    <button id="sendBtn" type="submit">보내기</button>
+    <input id="input" autocomplete="off" placeholder="어떤 증상이 있으신가요?">
+    <button class="send" id="sendBtn" type="submit" aria-label="보내기">↑</button>
   </form>
 </div>
 <script>
@@ -156,49 +266,90 @@ const form = document.getElementById('form');
 const input = document.getElementById('input');
 const sendBtn = document.getElementById('sendBtn');
 
-const emptyHint = log.querySelector('.empty-hint');
+const EXAMPLES = ['위염이 뭐야?', '머리가 아프고 속이 메스꺼워요', '당뇨병 관련 논문 찾아줘'];
 
-function addMsg(text, who, pending) {
-  if (emptyHint) emptyHint.remove();
+function showWelcome() {
+  log.innerHTML = '';
+  const box = document.createElement('div');
+  box.className = 'welcome';
+  box.innerHTML =
+    '<div class="big">🩺</div>' +
+    '<h2>어디가 불편하신가요?</h2>' +
+    '<p>증상을 자유롭게 설명해주시면 관련 질환 정보를 찾아드려요.<br>' +
+    '정확한 병명을 모르셔도 괜찮아요.</p>';
+  const chips = document.createElement('div');
+  chips.className = 'chips';
+  EXAMPLES.forEach((text) => {
+    const chip = document.createElement('button');
+    chip.className = 'chip';
+    chip.type = 'button';
+    chip.textContent = text;
+    chip.addEventListener('click', () => { input.value = text; send(); });
+    chips.appendChild(chip);
+  });
+  box.appendChild(chips);
+  log.appendChild(box);
+}
+
+function clearWelcome() {
+  const w = log.querySelector('.welcome');
+  if (w) w.remove();
+}
+
+function addMsg(text, who) {
+  clearWelcome();
   const row = document.createElement('div');
-  row.className = 'row ' + who + (pending ? ' pending' : '');
+  row.className = 'row ' + who;
   const avatar = document.createElement('div');
   avatar.className = 'avatar';
   avatar.textContent = who === 'user' ? '🙂' : '🩺';
   const bubble = document.createElement('div');
   bubble.className = 'msg';
   bubble.textContent = text;
-  row.appendChild(avatar);
-  row.appendChild(bubble);
+  row.append(avatar, bubble);
   log.appendChild(row);
   log.scrollTop = log.scrollHeight;
   return row;
 }
 
-form.addEventListener('submit', async (e) => {
-  e.preventDefault();
+function addTyping() {
+  clearWelcome();
+  const row = document.createElement('div');
+  row.className = 'row bot';
+  row.innerHTML =
+    '<div class="avatar">🩺</div>' +
+    '<div class="msg"><div class="typing"><i></i><i></i><i></i></div>' +
+    '<div class="hint-text">자료를 찾고 있어요 · 수십 초 걸릴 수 있어요</div></div>';
+  log.appendChild(row);
+  log.scrollTop = log.scrollHeight;
+  return row;
+}
+
+async function send() {
   const question = input.value.trim();
-  if (!question) return;
+  if (!question || sendBtn.disabled) return;
   addMsg(question, 'user');
   input.value = '';
   sendBtn.disabled = true;
-  const pending = addMsg('생각하는 중... (검색 내용에 따라 수십 초 걸릴 수 있어요)', 'bot', true);
+  const typing = addTyping();
   try {
     const resp = await fetch('/api/chat', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({question}),
     });
     const data = await resp.json();
-    pending.remove();
+    typing.remove();
     addMsg(data.answer, 'bot');
   } catch (err) {
-    pending.remove();
+    typing.remove();
     addMsg('오류가 발생했어요: ' + err, 'bot');
   } finally {
     sendBtn.disabled = false;
     input.focus();
   }
-});
+}
+
+form.addEventListener('submit', (e) => { e.preventDefault(); send(); });
 
 document.getElementById('summaryBtn').addEventListener('click', async () => {
   const resp = await fetch('/api/summary');
@@ -208,8 +359,11 @@ document.getElementById('summaryBtn').addEventListener('click', async () => {
 
 document.getElementById('resetBtn').addEventListener('click', async () => {
   await fetch('/api/reset', {method: 'POST'});
-  log.innerHTML = '<div class="empty-hint">예: "위염이 뭐야?", "머리가 아프고 속이 메스꺼워요"</div>';
+  showWelcome();
 });
+
+showWelcome();
+input.focus();
 </script>
 </body>
 </html>
