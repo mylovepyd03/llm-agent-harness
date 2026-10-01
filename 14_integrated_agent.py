@@ -1192,6 +1192,35 @@ def _looks_like_interview_answer(user_question: str) -> bool:
     return _DISEASE_SUFFIX_RE.search(clean_disease_query(user_question)) is None
 
 
+def _record_fallback_result(state: MedicalConversationState, user_question: str,
+                            known_term: str | None, asked_unknown_disease: bool,
+                            source_topic: str | None, tool_label: str):
+    """폴백 도구(MedlinePlus/위키피디아/PubMed)로 답했을 때 state에 기록한다.
+
+    예전엔 "known_term이 없으면 사용자가 증상을 서술한 것"이라고 가정해서 질문
+    문장을 그대로 '증상'에 넣었는데, 그러면 병명을 물어본 경우에도
+    "주사피부염일때 어떻게 해야해?"가 증상 목록에 쌓이고 질환은 영문 제목
+    ("Rosacea")으로 남는 오염이 생긴다(2026-10-02 사용자 지적). 지금은
+    "코퍼스에 없는 병명을 물어본 경우"를 구분할 수 있으므로 그에 맞게 기록한다."""
+    if known_term:
+        state.record_disease(known_term, tool_label)
+        state.last_topic = known_term
+        return
+    if asked_unknown_disease:
+        # 사용자가 물어본 병명 자체를 질환으로 기록(한국어 그대로), 출처에 어떤
+        # 자료에서 찾았는지 남긴다. 증상 목록은 건드리지 않는다.
+        asked_name = clean_disease_query(user_question)
+        label = f"{tool_label}({source_topic})" if source_topic else tool_label
+        state.record_disease(asked_name, label)
+        state.last_topic = asked_name
+        return
+    if source_topic:
+        # 증상을 서술해서 여기까지 온 경우에만 서술을 '증상'으로 남기고,
+        # 매칭된 주제는 '추정 질환'으로 기록한다.
+        state.record_symptom(user_question, f"{tool_label}(추정: {source_topic})")
+        state.record_disease(source_topic, f"{tool_label}(증상 매칭 추정)")
+
+
 def _handle_interview_answer(messages: list, user_question: str,
                              state: MedicalConversationState) -> str | None:
     """문진 답변을 원래 호소에 누적하고, 모인 설명으로 다시 검색해본다.
@@ -1314,15 +1343,11 @@ def run_agent_turn(messages: list, user_question: str, state: MedicalConversatio
             medline_result = search_medlineplus(known_term or user_question)
             if not _is_failure_message(medline_result):
                 parts.append(medline_result)
-                recorded = known_term
-                if not recorded:
-                    title_match = re.search(r"\(출처: MedlinePlus '(.+?)'", medline_result)
-                    recorded = title_match.group(1) if title_match else None
-                if recorded:
-                    state.record_disease(recorded, "search_medlineplus")
-                    if not known_term:
-                        state.record_symptom(user_question, f"search_medlineplus(추정: {recorded})")
-                state.last_topic = known_term or state.last_topic
+                topic_match = re.search(r"\(출처: MedlinePlus '(.+?)'", medline_result)
+                _record_fallback_result(
+                    state, user_question, known_term, asked_unknown_disease,
+                    topic_match.group(1) if topic_match else None, "search_medlineplus",
+                )
                 combined = "\n\n".join(parts)
                 state.awaiting_followup_reply = "?" in combined[-200:]
                 messages.append({"role": "assistant", "content": combined})
@@ -1332,25 +1357,17 @@ def run_agent_turn(messages: list, user_question: str, state: MedicalConversatio
             wiki_result = search_wikipedia(known_term or user_question)
             if not _is_failure_message(wiki_result):
                 parts.append(wiki_result)
-                if known_term:
-                    state.record_disease(known_term, "search_wikipedia(fallback)")
-                else:
-                    # 위키피디아 결과 형식 "[위키피디아 - 제목]\n..."에서 실제 문서 제목을
-                    # 뽑아 기록. 정확한 병명이 아니라 사용자의 증상 서술로 여기까지 왔으므로,
-                    # 서술 자체는 "증상"으로, 매칭된 병명은 "추정 질환"으로 같이 남긴다 -
-                    # 여러 턴에 걸쳐 증상이 쌓이고 같은 질환이 후보로 반복되면 문진처럼
-                    # 좁혀지는 걸 state.summary()에서 볼 수 있게 하기 위함.
-                    # 위키 답변 형식 두 가지를 모두 지원: 요약 실패 시 원문 그대로
-                    # 반환하는 "[위키피디아 - 제목]\n..." 형식과, 요약 성공 시
-                    # 끝에 붙는 "(출처: 위키피디아 '제목')" 형식.
-                    title_match = (
-                        re.match(r"\[위키피디아 - (.+?)\]", wiki_result)
-                        or re.search(r"\(출처: 위키피디아 '(.+?)'\)", wiki_result)
-                    )
-                    if title_match:
-                        matched_name = title_match.group(1)
-                        state.record_symptom(user_question, f"search_wikipedia(fallback, 추정: {matched_name})")
-                        state.record_disease(matched_name, "search_wikipedia(fallback, 증상 매칭 추정)")
+                # 위키 답변 형식 두 가지를 모두 지원: 요약 실패 시 원문 그대로
+                # 반환하는 "[위키피디아 - 제목]\n..." 형식과, 요약 성공 시
+                # 끝에 붙는 "(출처: 위키피디아 '제목')" 형식.
+                title_match = (
+                    re.match(r"\[위키피디아 - (.+?)\]", wiki_result)
+                    or re.search(r"\(출처: 위키피디아 '(.+?)'\)", wiki_result)
+                )
+                _record_fallback_result(
+                    state, user_question, known_term, asked_unknown_disease,
+                    title_match.group(1) if title_match else None, "search_wikipedia(fallback)",
+                )
             else:
                 # 3) 위키피디아까지 실패하면 PubMed로 마지막 시도 (건강정보포털/
                 # 위키피디아 둘 다 없는 병명이라도, PubMed는 영어 의학 문헌
@@ -1372,7 +1389,9 @@ def run_agent_turn(messages: list, user_question: str, state: MedicalConversatio
                             "질환과 다를 수 있다는 점을 꼭 감안해주세요.\n\n"
                             f"{rag_result}"
                         )
-                        state.record_symptom(user_question, "병명 미확인(유사 질환 참고 안내)")
+                        # 물어본 병명 자체는 질환으로 남기되, 자료를 못 찾았다는
+                        # 사실을 출처에 분명히 적어둔다(증상 목록은 건드리지 않음).
+                        state.record_disease(fallback_keyword, "자료 미확인(유사 질환만 참고 안내)")
                         state.awaiting_followup_reply = "?" in combined[-200:]
                         messages.append({"role": "assistant", "content": combined})
                         return combined
@@ -1384,8 +1403,10 @@ def run_agent_turn(messages: list, user_question: str, state: MedicalConversatio
                         "증상이나 병명을 조금 더 구체적으로 말씀해주시겠어요?"
                     )
                 parts.append(pubmed_result)
-                state.record_symptom(user_question, f"search_pubmed_deep(fallback, 추정: {fallback_keyword})")
-                state.record_disease(fallback_keyword, "search_pubmed_deep(fallback)")
+                _record_fallback_result(
+                    state, user_question, known_term, asked_unknown_disease,
+                    fallback_keyword, "search_pubmed_deep(fallback)",
+                )
         else:
             print("  [파이프라인] 건강포털 RAG 성공")
             parts.append(rag_result)
