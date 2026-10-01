@@ -1030,7 +1030,8 @@ FOLLOWUP_MARKERS = ("그럼", "그거", "그건", "그게", "그것", "이거", 
 SHORT_REPLY_MAX_CHARS = 8
 
 
-def resolve_query_with_context(user_question: str, state: MedicalConversationState):
+def resolve_query_with_context(user_question: str, state: MedicalConversationState,
+                               intent: dict | None = None):
     """이번 질문에서 병명을 직접 찾고, 지칭어(그럼/그거 등)가 있을 때만
     state.last_topic을 힌트로 활용한다. LLM 없이 순수 문자열 처리로
     '그럼 치료법은?' 같은 질문이 이전 주제를 잃지 않게 한다.
@@ -1041,6 +1042,13 @@ def resolve_query_with_context(user_question: str, state: MedicalConversationSta
     확인했음. 검색은 이전 주제 하나로만 안전하게 하고, 그 대답 내용은 LLM한테
     질문으로만 보여줘서 답변에 반영되게 한다.
 
+    intent(판단 레이어 결과)가 있으면 추가 신호로 쓴다:
+      - intent가 "followup"이면 지칭어가 없어도 이전 주제를 이어받는다
+      - 원문에 사전 병명이 그대로 없어도(예: "당뇨" -> 사전엔 "당뇨병"), 판단
+        레이어가 정리한 병명이 사전에 있으면 known_term으로 인정한다.
+        사전에 있는지는 여기서 코드로 다시 확인하므로, 모델이 병명을 지어내도
+        사전에 없는 이름이면 known_term이 되지 않는다.
+
     반환값: (search_text, question_text, known_term)"""
     known_term = find_known_term_in_text(user_question)
     if known_term:
@@ -1049,11 +1057,15 @@ def resolve_query_with_context(user_question: str, state: MedicalConversationSta
         any(marker in user_question for marker in FOLLOWUP_MARKERS)
         or state.awaiting_followup_reply
         or len(user_question.strip()) <= SHORT_REPLY_MAX_CHARS
+        or (intent is not None and intent["intent"] == "followup")
     )
     if state.last_topic and is_followup:
         implied_term = state.last_topic if state.last_topic in KDCA_CORPUS else None
         combined_question = f"{state.last_topic} {user_question}"
         return state.last_topic, combined_question, implied_term
+    if (intent is not None and intent["intent"] == "disease_info"
+            and intent["disease_name"] in KDCA_CORPUS):
+        return user_question, user_question, intent["disease_name"]
     return user_question, user_question, None
 
 
@@ -1194,7 +1206,8 @@ def _looks_like_interview_answer(user_question: str) -> bool:
 
 def _record_fallback_result(state: MedicalConversationState, user_question: str,
                             known_term: str | None, asked_unknown_disease: bool,
-                            source_topic: str | None, tool_label: str):
+                            source_topic: str | None, tool_label: str,
+                            asked_name: str | None = None):
     """폴백 도구(MedlinePlus/위키피디아/PubMed)로 답했을 때 state에 기록한다.
 
     예전엔 "known_term이 없으면 사용자가 증상을 서술한 것"이라고 가정해서 질문
@@ -1209,7 +1222,7 @@ def _record_fallback_result(state: MedicalConversationState, user_question: str,
     if asked_unknown_disease:
         # 사용자가 물어본 병명 자체를 질환으로 기록(한국어 그대로), 출처에 어떤
         # 자료에서 찾았는지 남긴다. 증상 목록은 건드리지 않는다.
-        asked_name = clean_disease_query(user_question)
+        asked_name = asked_name or clean_disease_query(user_question)
         label = f"{tool_label}({source_topic})" if source_topic else tool_label
         state.record_disease(asked_name, label)
         state.last_topic = asked_name
@@ -1276,7 +1289,254 @@ def _handle_interview_answer(messages: list, user_question: str,
     return combined
 
 
+
+# ---------------------------------------------------------------------------
+# 판단 레이어 (2026-10-02 추가): 질문 이해만 Claude Haiku에게 맡긴다
+#
+# 지금까지 "이 질문이 뭘 묻는 건지"는 전부 규칙으로 판단했다:
+#   병명인지 증상인지 -> _SYMPTOM_COMPLAINT_RE + 3글자 기준
+#   문진 답변인지     -> 병명 접미사(염/병/증...) 검사
+#   논문을 원하는지   -> "논문/연구" 키워드
+#   이전 주제 잇기    -> "그럼/그거" 마커
+# 버그를 하나 고칠 때마다 규칙이 하나씩 늘었고("속" -> 속옷, "저녁부터" -> 병명
+# 오판), 처음 보는 표현에는 계속 약했다. 그런데 이 규칙들은 결국 "이 사람이
+# 뭘 묻는 거지?"라는 한 가지 질문을 쪼개서 답하고 있었다.
+#
+# 그래서 그 판단 하나만 큰 모델(Haiku)에게 객관식으로 맡긴다. 프로젝트 전체
+# 결론("판단은 코드, LLM은 좁은 역할")은 그대로다 - Haiku는 정해진 선택지 중
+# 하나를 고르는 좁은 역할만 하고, 검색·답변 생성은 여전히 로컬(bge-m3,
+# llama3.1)이 한다. 질문 1번에 Haiku 호출 1번(약 0.4원).
+#
+# 안전장치:
+#   - API 키가 없거나, 패키지가 없거나, 호출이 실패하면 classify_turn()이 None을
+#     돌려주고, 그러면 파이프라인은 예전 규칙 그대로 동작한다(앱이 죽지 않음)
+#   - 병명은 Haiku가 말했다고 믿지 않고, KDCA 사전에 실제로 있는지 코드로 확인
+#   - "논문" 키워드 규칙은 Haiku 판단과 OR로 유지(놓치는 쪽만 보완)
+#   - 끄고 싶으면 .env에 USE_INTENT_LAYER=0
+#   - 매 판단을 data/intent_log.jsonl에 규칙 판단과 나란히 남긴다 -> 나중에
+#     "규칙 vs Haiku" 판단이 어디서 갈리는지 비교 분석할 수 있다
+# ---------------------------------------------------------------------------
+try:
+    import anthropic
+except ImportError:
+    anthropic = None
+
+INTENT_MODEL = os.environ.get("INTENT_MODEL", "claude-haiku-4-5-20251001")
+USE_INTENT_LAYER = os.environ.get("USE_INTENT_LAYER", "1") != "0"
+INTENT_LOG_PATH = os.path.join(os.path.dirname(__file__), "data", "intent_log.jsonl")
+INTENT_TIMEOUT_SECONDS = 15
+
+INTENT_LABELS = ("symptom", "disease_info", "interview_answer", "followup", "off_topic")
+
+INTENT_SYSTEM_PROMPT = (
+    "당신은 한국어 건강 상담 챗봇의 '접수 담당'입니다. 답변은 하지 않고, 사용자의 "
+    "이번 입력이 어떤 종류인지만 분류해서 report_intent 도구로 보고합니다.\n\n"
+    "[intent 선택지]\n"
+    "- symptom: 자기 몸의 증상을 호소하거나 서술함 (예: '속이 매스꺼워', "
+    "'머리가 띵하고 어지러워요')\n"
+    "- disease_info: 특정 병명/질환에 대해 물어봄 (예: '위염이 뭐야?', "
+    "'주사피부염일 때 어떻게 해야 해?', '당뇨 있으면 뭘 조심해?')\n"
+    "- interview_answer: [문진 중]인 상황에서, 우리가 던진 질문에 답하거나 같은 "
+    "증상에 대한 정보를 덧붙임 (시간 '저녁부터', 빈도, 정도, 악화 요인, 동반 "
+    "증상 등). 문진 중이 아니면 절대 고르지 마세요.\n"
+    "- followup: 직전 대화 주제에 이어서 묻는 말 (예: '그럼 치료법은?', "
+    "'그건 전염돼?', '네 심해요')\n"
+    "- off_topic: 건강·의료와 명백히 무관함 (예: '오늘 날씨 어때?'). 조금이라도 "
+    "건강과 관련 있으면 고르지 마세요.\n\n"
+    "[disease_name]\n"
+    "사용자가 병명을 **직접 말했을 때만** 표준 한국어 병명으로 적으세요 "
+    "(예: '당뇨' -> '당뇨병'). 증상만 말했다면 병명을 추측하지 말고 빈 문자열로 "
+    "두세요. followup이면 이어받는 주제의 병명을 적어도 됩니다.\n\n"
+    "[wants_research]\n"
+    "논문, 연구 결과, 최신 근거, 임상시험 등 학술 근거를 원하면 true.\n\n"
+    "[red_flag]\n"
+    "즉시 응급 진료가 필요할 수 있는 신호(가슴 통증·압박감, 숨이 참, 갑작스러운 "
+    "마비·말 어눌함·얼굴 처짐, 의식 저하, 심한 출혈, 토혈·혈변, 갑자기 시작된 "
+    "생애 최악의 두통, 자해 위험 등)가 입력에 있으면 true. 애매하면 false."
+)
+
+INTENT_TOOL = {
+    "name": "report_intent",
+    "description": "사용자 입력의 분류 결과를 보고한다.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "intent": {"type": "string", "enum": list(INTENT_LABELS)},
+            "disease_name": {"type": "string", "description": "직접 언급된 병명(표준 한국어). 없으면 빈 문자열."},
+            "wants_research": {"type": "boolean"},
+            "red_flag": {"type": "boolean"},
+            "reason": {"type": "string", "description": "판단 근거 한 줄"},
+        },
+        "required": ["intent", "disease_name", "wants_research", "red_flag", "reason"],
+    },
+}
+
+_intent_client = None
+_intent_disabled_reason: str | None = None
+
+
+def _get_intent_client():
+    """클라이언트는 처음 한 번만 만든다. 쓸 수 없는 이유가 있으면 한 번만 알리고 None."""
+    global _intent_client, _intent_disabled_reason
+    if _intent_client is not None or _intent_disabled_reason is not None:
+        return _intent_client
+    if not USE_INTENT_LAYER:
+        _intent_disabled_reason = "USE_INTENT_LAYER=0"
+    elif anthropic is None:
+        _intent_disabled_reason = "anthropic 패키지 없음 (pip install anthropic)"
+    elif not os.environ.get("ANTHROPIC_API_KEY"):
+        _intent_disabled_reason = ".env에 ANTHROPIC_API_KEY 없음"
+    if _intent_disabled_reason:
+        print(f"  [판단 레이어] 꺼짐: {_intent_disabled_reason} -> 규칙 기반으로 동작")
+        return None
+    # accept-encoding을 gzip으로 고정하는 이유: 이 환경의 anthropic SDK가 내부적으로
+    # 쓰는 httpx2가 brotli 응답을 풀 때 설치된 brotli 바인딩과 호출 규약이 맞지 않아
+    # "TypeError: process() takes no keyword arguments"로 모든 요청이 실패했음
+    # (APIConnectionError로 보여서 네트워크 문제처럼 보였지만 실제론 응답 압축 해제
+    # 단계 문제였음). brotli를 안 받으면 그 경로를 아예 타지 않는다.
+    _intent_client = anthropic.Anthropic(
+        timeout=INTENT_TIMEOUT_SECONDS, max_retries=1,
+        default_headers={"accept-encoding": "gzip"},
+    )
+    return _intent_client
+
+
+def _last_assistant_text(messages: list, max_chars: int = 300) -> str:
+    for m in reversed(messages):
+        if m.get("role") == "assistant":
+            return m["content"][-max_chars:]
+    return ""
+
+
+def _validate_intent(raw: dict) -> dict | None:
+    """모델 출력이 형식에 맞는지 코드로 다시 확인한다(틀리면 None -> 규칙으로)."""
+    if not isinstance(raw, dict) or raw.get("intent") not in INTENT_LABELS:
+        return None
+    return {
+        "intent": raw["intent"],
+        "disease_name": str(raw.get("disease_name") or "").strip(),
+        "wants_research": bool(raw.get("wants_research")),
+        "red_flag": bool(raw.get("red_flag")),
+        "reason": str(raw.get("reason") or "")[:200],
+    }
+
+
+def _log_intent(user_question: str, state: MedicalConversationState, intent: dict | None,
+                error: str | None = None) -> None:
+    """Haiku 판단과 기존 규칙 판단을 나란히 기록한다(비교 분석용). 실패해도 무시."""
+    try:
+        candidate = clean_disease_query(user_question)
+        rule = {
+            "known_term": find_known_term_in_text(user_question),
+            "name_like": is_name_like_query(user_question, candidate),
+            "interview_answer": (bool(state.pending_complaint)
+                                 and _looks_like_interview_answer(user_question)),
+            "wants_research": wants_research(user_question),
+        }
+        record = {
+            "time": datetime.now().isoformat(timespec="seconds"),
+            "question": user_question,
+            "in_interview": bool(state.pending_complaint),
+            "model": INTENT_MODEL,
+            "intent": intent,
+            "rule": rule,
+            "error": error,
+        }
+        os.makedirs(os.path.dirname(INTENT_LOG_PATH), exist_ok=True)
+        with open(INTENT_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def classify_turn(user_question: str, state: MedicalConversationState,
+                  messages: list) -> dict | None:
+    """이번 입력의 의도를 Haiku로 분류한다. 실패하면 None(= 예전 규칙으로 동작)."""
+    client = _get_intent_client()
+    if client is None:
+        return None
+
+    context_lines = []
+    if state.pending_complaint:
+        answers = ", ".join(state.followup_answers) or "(아직 없음)"
+        context_lines.append(f"[문진 중] 원래 호소: {state.pending_complaint} / 받은 답변: {answers}")
+    else:
+        context_lines.append("[문진 중 아님]")
+    if state.last_topic:
+        context_lines.append(f"[직전 주제] {state.last_topic}")
+    last_reply = _last_assistant_text(messages)
+    if last_reply:
+        context_lines.append(f"[직전 챗봇 답변 끝부분] {last_reply}")
+    context_lines.append(f"[이번 사용자 입력] {user_question}")
+
+    try:
+        resp = client.messages.create(
+            model=INTENT_MODEL,
+            max_tokens=300,
+            # temperature는 설치된 anthropic SDK(1.11.0)에서 지원하지 않아 뺐다
+            # (넘기면 TypeError). 분류 출력은 report_intent 도구 스키마(enum)로
+            # 이미 제약돼 있어서 흔들릴 여지가 적다.
+            system=INTENT_SYSTEM_PROMPT,
+            tools=[INTENT_TOOL],
+            tool_choice={"type": "tool", "name": "report_intent"},
+            messages=[{"role": "user", "content": "\n".join(context_lines)}],
+        )
+        raw = next((b.input for b in resp.content if b.type == "tool_use"), None)
+        intent = _validate_intent(raw)
+        if intent is None:
+            print(f"  [판단 레이어] 형식이 맞지 않는 응답 -> 규칙 기반으로 대체: {raw}")
+            _log_intent(user_question, state, None, error=f"invalid: {raw}")
+            return None
+    except Exception as e:  # 네트워크, 인증, 잔액 부족 등 무엇이든 -> 규칙으로
+        print(f"  [판단 레이어] 호출 실패 -> 규칙 기반으로 대체: {type(e).__name__}: {e}")
+        _log_intent(user_question, state, None, error=f"{type(e).__name__}: {e}")
+        return None
+
+    print(f"  [판단 레이어] {intent['intent']}"
+          f"{' / 병명=' + intent['disease_name'] if intent['disease_name'] else ''}"
+          f"{' / 논문' if intent['wants_research'] else ''}"
+          f"{' / 응급신호' if intent['red_flag'] else ''}"
+          f" ({intent['reason']})")
+    _log_intent(user_question, state, intent)
+    return intent
+
+
+RED_FLAG_NOTICE = (
+    "⚠️ 말씀하신 내용에는 바로 진료가 필요할 수 있는 신호가 있어요. 가슴 통증, "
+    "숨이 참, 갑작스러운 마비나 말 어눌함, 의식이 흐려짐 같은 증상이 있다면 지금 "
+    "바로 119에 전화하거나 가까운 응급실로 가세요."
+)
+
+OFF_TOPIC_MESSAGE = (
+    "이 질문은 제가 다루는 건강/의료 정보 범위를 벗어났거나, "
+    "제가 아는 정보로는 답변하기 어려운 내용인 것 같아요. "
+    "증상이나 병명을 조금 더 구체적으로 말씀해주시겠어요?"
+)
+
+
+def _asked_disease_name(user_question: str, intent: dict | None) -> str | None:
+    """사용자가 '특정 병명'을 물었다면 그 병명, 아니면 None.
+    판단 레이어가 있으면 그 판단을, 없으면 예전 규칙(is_name_like_query)을 쓴다."""
+    if intent is not None:
+        if intent["intent"] == "disease_info" and intent["disease_name"]:
+            return intent["disease_name"]
+        return None
+    candidate = clean_disease_query(user_question)
+    return candidate if is_name_like_query(user_question, candidate) else None
+
+
 def run_agent_turn(messages: list, user_question: str, state: MedicalConversationState) -> str:
+    """한 턴의 입구: 먼저 판단 레이어로 질문을 분류하고, 그 결과를 들고 기존
+    파이프라인(_run_pipeline)을 돈다. 응급 신호가 있으면 답변 맨 앞에 안내를 붙인다."""
+    intent = classify_turn(user_question, state, messages)
+    answer = _run_pipeline(messages, user_question, state, intent)
+    if intent is not None and intent["red_flag"]:
+        answer = f"{RED_FLAG_NOTICE}\n\n{answer}"
+    return answer
+
+
+def _run_pipeline(messages: list, user_question: str, state: MedicalConversationState,
+                  intent: dict | None = None) -> str:
     """C단계: messages(대화 원문)와 state(구조화된 요약)를 둘 다 세션 내내 이어받는다.
     도구 선택은 LLM이 아니라 고정된 파이프라인 순서로 결정한다.
 
@@ -1293,12 +1553,27 @@ def run_agent_turn(messages: list, user_question: str, state: MedicalConversatio
         # 이 입력을 독립된 질의로 검색하지 않는다. 사용자의 답변은 증상이 아니라
         # 시간("저녁부터")·빈도·정도일 수 있어서, 그걸 그대로 검색하면 "저녁부터는
         # 찾지 못했다"는 엉뚱한 답이 나옴(실제 발생). 원래 호소에 누적해서 다룬다.
-        if state.pending_complaint and _looks_like_interview_answer(user_question):
-            answer = _handle_interview_answer(messages, user_question, state)
-            if answer is not None:
-                return answer
+        # (판단 레이어가 있으면 "문진 답변인지"를 그 판단으로, 없으면 예전 규칙으로)
+        if state.pending_complaint:
+            is_interview_answer = (
+                intent["intent"] == "interview_answer" if intent is not None
+                else _looks_like_interview_answer(user_question)
+            )
+            if is_interview_answer:
+                answer = _handle_interview_answer(messages, user_question, state)
+                if answer is not None:
+                    return answer
 
-        search_text, question_text, known_term = resolve_query_with_context(user_question, state)
+        # 건강과 무관한 질문이면 검색을 아예 돌리지 않는다(예전엔 KDCA -> MedlinePlus
+        # -> 위키 -> PubMed를 다 돌고 나서야 같은 안내 문구로 끝났음)
+        if intent is not None and intent["intent"] == "off_topic":
+            print("  [파이프라인] 판단 레이어: 건강과 무관한 질문 -> 검색 생략")
+            messages.pop()
+            state.turn -= 1
+            return OFF_TOPIC_MESSAGE
+
+        search_text, question_text, known_term = resolve_query_with_context(user_question, state, intent)
+        asked_name = _asked_disease_name(user_question, intent)
         parts: list[str] = []
 
         # 1) 건강포털 RAG 먼저 시도 (검색은 search_text로, LLM 질문은 question_text로 - 분리 이유는 resolve_query_with_context 참고)
@@ -1311,10 +1586,7 @@ def run_agent_turn(messages: list, user_question: str, state: MedicalConversatio
         # 깨끗한 수건으로 지혈하라"는 날조 답변이 나왔음(2026-10-02). 임계값을 더
         # 올려서 막으려 하면 당뇨병(0.630)·고혈압(0.627) 같은 정상 조회가 깨지므로,
         # "물어본 병명과 매칭된 병명이 다르다"는 사실 자체로 판단한다.
-        asked_unknown_disease = (
-            not known_term
-            and is_name_like_query(user_question, clean_disease_query(user_question))
-        )
+        asked_unknown_disease = not known_term and asked_name is not None
         if asked_unknown_disease and not _is_failure_message(rag_result):
             print("  [파이프라인] 코퍼스에 없는 병명 질문 -> KDCA 매칭(다른 질환) 보류, 외부 소스 우선")
 
@@ -1324,8 +1596,12 @@ def run_agent_turn(messages: list, user_question: str, state: MedicalConversatio
             # 외부 검색을 아예 하지 않고 증상을 더 물어본다. 이 판단 없이 검색을
             # 돌렸다가 "속" -> "속옷" 문서, "배" -> PubMed 정신건강 논문처럼
             # 엉뚱한 자료를 답변으로 내놓는 사례가 실제로 있었음(2026-10-01).
-            name_candidate = known_term or clean_disease_query(user_question)
-            if not is_name_like_query(user_question, name_candidate):
+            if intent is not None:
+                go_interview = not known_term and asked_name is None
+            else:
+                name_candidate = known_term or clean_disease_query(user_question)
+                go_interview = not is_name_like_query(user_question, name_candidate)
+            if go_interview:
                 print("  [파이프라인] 병명이 아닌 증상 호소로 판단 -> 외부 검색 생략, 문진 시작")
                 combined = ask_for_more_detail(user_question)
                 state.record_symptom(user_question, "증상 호소(문진 시작)")
@@ -1339,14 +1615,16 @@ def run_agent_turn(messages: list, user_question: str, state: MedicalConversatio
             # 애초에 건강 주제만 모아둔 DB여서 비의료 문서가 걸릴 일이 없고,
             # 주제 태그(altTitle)로 병명이 직접 매칭되는지 확인할 수 있어 근거가
             # 더 분명하다. 대신 영문 DB라 병명 영문 매핑이 안 되면 건너뛴다.
+            lookup = known_term or (asked_name if intent is not None else None) or user_question
             print("  [파이프라인] 건강포털 RAG 실패 -> MedlinePlus(NIH) 시도")
-            medline_result = search_medlineplus(known_term or user_question)
+            medline_result = search_medlineplus(lookup)
             if not _is_failure_message(medline_result):
                 parts.append(medline_result)
                 topic_match = re.search(r"\(출처: MedlinePlus '(.+?)'", medline_result)
                 _record_fallback_result(
                     state, user_question, known_term, asked_unknown_disease,
                     topic_match.group(1) if topic_match else None, "search_medlineplus",
+                    asked_name=asked_name,
                 )
                 combined = "\n\n".join(parts)
                 state.awaiting_followup_reply = "?" in combined[-200:]
@@ -1354,7 +1632,7 @@ def run_agent_turn(messages: list, user_question: str, state: MedicalConversatio
                 return combined
 
             print("  [파이프라인] MedlinePlus 실패 -> 위키피디아로 대체")
-            wiki_result = search_wikipedia(known_term or user_question)
+            wiki_result = search_wikipedia(lookup)
             if not _is_failure_message(wiki_result):
                 parts.append(wiki_result)
                 # 위키 답변 형식 두 가지를 모두 지원: 요약 실패 시 원문 그대로
@@ -1367,6 +1645,7 @@ def run_agent_turn(messages: list, user_question: str, state: MedicalConversatio
                 _record_fallback_result(
                     state, user_question, known_term, asked_unknown_disease,
                     title_match.group(1) if title_match else None, "search_wikipedia(fallback)",
+                    asked_name=asked_name,
                 )
             else:
                 # 3) 위키피디아까지 실패하면 PubMed로 마지막 시도 (건강정보포털/
@@ -1374,7 +1653,7 @@ def run_agent_turn(messages: list, user_question: str, state: MedicalConversatio
                 # 전체를 대상으로 하므로 찾을 가능성이 있음 - "주사피부염"처럼
                 # 국내 자료엔 드물지만 해외 연구는 많은 경우가 실제로 있었음).
                 print("  [파이프라인] 위키피디아도 실패 -> PubMed로 마지막 시도")
-                fallback_keyword = known_term or clean_disease_query(user_question)
+                fallback_keyword = known_term or asked_name or clean_disease_query(user_question)
                 pubmed_result = search_pubmed_deep(fallback_keyword)
                 if _is_failure_message(pubmed_result):
                     # 외부 소스가 전부 실패했지만, 코퍼스에 없는 병명을 물어서
@@ -1397,15 +1676,12 @@ def run_agent_turn(messages: list, user_question: str, state: MedicalConversatio
                         return combined
                     messages.pop()
                     state.turn -= 1
-                    return (
-                        "이 질문은 제가 다루는 건강/의료 정보 범위를 벗어났거나, "
-                        "제가 아는 정보로는 답변하기 어려운 내용인 것 같아요. "
-                        "증상이나 병명을 조금 더 구체적으로 말씀해주시겠어요?"
-                    )
+                    return OFF_TOPIC_MESSAGE
                 parts.append(pubmed_result)
                 _record_fallback_result(
                     state, user_question, known_term, asked_unknown_disease,
                     fallback_keyword, "search_pubmed_deep(fallback)",
+                    asked_name=asked_name,
                 )
         else:
             print("  [파이프라인] 건강포털 RAG 성공")
@@ -1432,7 +1708,8 @@ def run_agent_turn(messages: list, user_question: str, state: MedicalConversatio
                 state.record_disease(known_term, "search_disease_code")
 
         # 4) "논문"/"연구" 같은 표현이 있으면 PubMed 추가 (정확한 병명이 있을 때만 - 검색어가 필요해서)
-        if known_term and wants_research(user_question):
+        research = wants_research(user_question) or (intent is not None and intent["wants_research"])
+        if known_term and research:
             print("  [파이프라인] '논문/연구' 표현 감지 -> PubMed 추가")
             pubmed_result = search_pubmed_deep(known_term)
             parts.append(pubmed_result)

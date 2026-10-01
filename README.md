@@ -33,6 +33,9 @@ LLM 기반 에이전트/하네스 시스템을 구현해보는 개인 학습 프
 - API 키: `.env` 파일에 보관 (git에 안 올라감, `.gitignore` 처리됨)
   - `DISEASE_INFO_SERVICE_KEY`: 공공데이터포털 건강보험심사평가원 질병정보서비스
   - `KDCA_HEALTH_INFO_TOKEN`: 질병관리청 국가건강정보포털
+  - `ANTHROPIC_API_KEY`: Claude API (판단 레이어 전용, 유료·질문당 약 0.4원). 없으면
+    판단 레이어가 자동으로 꺼지고 예전 규칙 기반으로 동작함. `pip install anthropic` 필요.
+    끄려면 `.env`에 `USE_INTENT_LAYER=0`
 - git: 로컬 저장소 + GitHub 저장소(`mylovepyd03/llm-agent-harness`, 2026-09-22부터 공개) 연결됨
 
 ## 로드맵
@@ -545,6 +548,39 @@ prefixsearch 기능의 부작용이었음(아래).
 **물어본 병명을 한국어 그대로 '질환'으로 기록**(출처에 `search_medlineplus(Rosacea)`
 처럼 찾은 자료명 병기)하고 증상 목록은 건드리지 않도록 수정. 단위 테스트로 세
 경우(코퍼스 밖 병명 / 코퍼스 안 병명 / 증상 서술) 모두 확인.
+
+### 2026-10-02 — 판단 레이어 추가: "질문 이해"만 Claude Haiku에게
+**배경**: 지금까지의 버그 수정을 돌아보니, 고칠 때마다 "이 질문이 뭘 묻는 거지?"를
+판단하는 규칙이 하나씩 늘어났음(증상 표현 정규식, 3글자 기준, 병명 접미사, "논문"
+키워드, "그럼/그거" 마커). 규칙은 처음 보는 표현에 계속 약했음("속"→속옷,
+"저녁부터"→병명 오판). 이 규칙들은 결국 한 가지 판단을 쪼개서 하고 있었으므로,
+그 판단 하나만 큰 모델에게 **객관식으로** 맡김.
+- `classify_turn()`: 턴 시작 시 Haiku(`claude-haiku-4-5`)를 1번 호출해서 도구 호출
+  형식(JSON)으로 `intent`(symptom / disease_info / interview_answer / followup /
+  off_topic), `disease_name`, `wants_research`, `red_flag`를 받음. 문진 상태·직전
+  주제·직전 답변 끝부분을 맥락으로 같이 넘김
+- **검색·답변 생성은 그대로 로컬**(bge-m3, llama3.1). 프로젝트 결론("판단은 코드,
+  LLM은 좁은 역할")은 유지 — Haiku도 정해진 선택지에서 고르는 좁은 역할만 함
+- 기존 `run_agent_turn` 본체는 `_run_pipeline(intent=...)`로 이름만 바꾸고, 분기
+  조건만 intent를 쓰도록 수정: 문진 답변 판단, 병명 질문 vs 증상 호소, 이전 주제
+  잇기, 논문 요청(키워드 규칙과 OR), 외부 검색어(문장 대신 정리된 병명)
+- 새 기능: `off_topic`이면 검색을 아예 안 돌림(예전엔 4개 소스를 다 돌고 나서야
+  안내 문구), `red_flag`면 답변 맨 앞에 119/응급실 안내
+- **안전장치**: 키·패키지 없음, 호출 실패, 형식 오류 → 전부 `None` → 예전 규칙
+  그대로 동작. Haiku가 말한 병명은 KDCA 사전에 실제로 있을 때만 `known_term`으로 인정
+- `data/intent_log.jsonl`: 매 턴 Haiku 판단과 규칙 판단을 나란히 기록 → 나중에
+  두 방식이 어디서 갈리는지 비교 분석용
+- 확인: 외부 호출을 전부 가짜로 바꾼 단위 테스트로 분기 9가지(증상→문진, 문진
+  답변, "당뇨"→당뇨병, 코퍼스 밖 병명, 무관한 질문, 응급 신호, 논문 요청, API 실패,
+  형식 오류) 확인
+- 실제 Haiku 호출을 붙이면서 환경 문제 3가지를 고쳐야 했음(전부 `APIConnectionError`
+  같은 엉뚱한 증상으로 보여서 원인 찾기가 필요했음):
+  1. 설치된 anthropic SDK(1.11.0)에 `temperature` 파라미터가 없어서 `TypeError` →
+     인자 제거(출력은 도구 스키마 enum으로 이미 제약됨)
+  2. `.env`의 키 접두사가 `sk-ant-sk-ant-`로 중복돼 401 → 중복분 제거
+  3. SDK 내부 httpx2가 brotli 응답을 풀 때 설치된 brotli 바인딩과 호출 규약이
+     맞지 않아 모든 요청 실패(`process() takes no keyword arguments`) →
+     클라이언트에 `accept-encoding: gzip`을 지정해 brotli 경로를 피함
 
 ## 파일 구성
 
