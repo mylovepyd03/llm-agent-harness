@@ -166,8 +166,18 @@ MIN_SIMILARITY_WIKIPEDIA = 0.4
 # 무관한 문서를 fuzzy하게 찾아오는 걸 확인함(예: "주사피부부염"(오타) -> "나혜석"
 # [무관한 인물], "로사시아" -> "사시"[사팔뜨기], 2026-09-23). 그래서 문서를
 # 찾아온 뒤 우리 자신의 임베딩으로 "질문과 본문이 실제로 관련 있는지" 한 번 더
-# 검증한다. 실측: 무관한 오검색 0.17~0.28, 정말 관련 있는 검색 0.53~0.71로
-# 뚜렷한 간격이 있어서 0.4로 잡음(KDCA 쪽과 달리 여긴 깔끔하게 갈림).
+# 검증한다. 완전히 무관한 오검색은 0.17~0.28이라 0.4 밑이면 그냥 버린다.
+
+CONFIDENT_SIMILARITY_WIKIPEDIA = 0.6
+# MIN_SIMILARITY_WIKIPEDIA만으론 부족한 사례를 발견함: "배가아파"처럼 짧고
+# 막연한 증상 질문은 KDCA가 실패한 뒤 위키피디아 폴백에서 "배"라는 공통 어근
+# 때문에 "배가로근"(복부 근육 해부학) 같은 일반 신체부위 문서가 0.49~0.59
+# 정도로 그럴듯하게 매칭됨(2026-10-01) - 완전 무관하진 않지만("배"는 맞으니)
+# "왜 아픈지"에는 답이 안 됨. 이걸 문턱값만 더 올려서 거르려 하면 "주사
+# (질병)"(0.66) 같은 진짜 좋은 매칭까지 같이 걸러질 위험이 있음. 그래서
+# "검색을 포기하진 않되, 확신에 찬 척도 안 하기"로 절충: 0.4~0.6 사이(애매한
+# 매칭)는 _hedge_wikipedia_answer()로 LLM이 찾은 내용을 반영해서 자연스럽게
+# 되묻게 하고, 0.6 이상(확실한 매칭)만 원문 그대로 보여준다.
 
 
 def _wikipedia_candidate_titles(query: str) -> list[str]:
@@ -254,11 +264,51 @@ def _best_wikipedia_match(query: str) -> dict | None:
     return best
 
 
+WIKI_HEDGE_SYSTEM_PROMPT = (
+    "당신은 위키피디아 자료를 바탕으로 답하는 친절한 건강정보 도우미입니다.\n"
+    "아래 [위키피디아 내용]은 사용자 질문과 완전히 같은 주제가 아닐 가능성이 "
+    "높습니다 - 단순히 단어 일부가 겹쳐서 찾아진 것일 수 있다고 생각하고 "
+    "조심스럽게 다루세요.\n"
+    "**절대로 이 내용을 사용자 증상의 원인이라고 추측하거나 연결짓지 마세요** "
+    "(예: '이 근육 때문에 아프신 것 같다', '~가 관여하는 것 같다' 같은 표현 금지). "
+    "참고자료에 없는 인과관계는 지어내면 안 됩니다.\n"
+    "먼저 '이 정보가 여쭤보신 것과 정확히 같은 내용인지는 확실하지 않다'는 점을 "
+    "분명히 밝히세요. 그다음 참고자료 내용을 짧게 있는 그대로만 전달하고(해석/추측 "
+    "없이), 마지막으로 사용자의 실제 증상을 더 구체적으로 설명해달라고 자연스럽게 "
+    "되물으세요(언제부터, 어떤 느낌으로, 다른 증상은 없는지 등).\n"
+    "질문 문장을 그대로 반복하지 말고, 간결하게 답하세요."
+)
+
+
+def _hedge_wikipedia_answer(query: str, title: str, extract: str) -> str:
+    """매칭이 애매한(관련은 있어 보이지만 확신할 정도는 아닌) 위키피디아 결과를
+    그대로 보여주지 않고, LLM이 "이게 정확히 맞는지는 모르겠다"는 걸 알리면서
+    찾은 내용에 나온 용어로 자연스럽게 되묻게 한다. 고정된 문구("더 구체적으로
+    말씀해주세요")로 틀에 박히게 되묻는 대신, 실제로 찾은 내용과 연결된 질문을
+    하도록 하기 위함."""
+    messages = [
+        {"role": "system", "content": WIKI_HEDGE_SYSTEM_PROMPT},
+        {"role": "user", "content": f"[사용자 질문]\n{query}\n\n[위키피디아 - {title}]\n{extract[:1000]}"},
+    ]
+    message = call_with_retry(messages, model=RAG_MODEL, num_predict=512)
+    if message is None:
+        # LLM 생성도 실패하면 안전하게 원문 + 정적 안내로 대체
+        return (
+            f"[위키피디아 - {title}]\n{extract[:1000]}\n\n"
+            "(참고: 정확히 어떤 증상을 말씀하시는지와는 다를 수 있어요. "
+            "조금 더 구체적으로 말씀해주시겠어요?)"
+        )
+    return message["content"]
+
+
 def search_wikipedia(query: str) -> str:
     query = clean_disease_query(query)
     match = _best_wikipedia_match(query)
     if match is None:
         return f"'{query}'에 대한 위키피디아 검색 결과가 없습니다."
+    if match["score"] < CONFIDENT_SIMILARITY_WIKIPEDIA:
+        print(f"    [경고] 위키피디아 매칭이 애매함('{match['title']}', 유사도 {match['score']:.2f}) - 되묻는 답으로 전환")
+        return _hedge_wikipedia_answer(query, match["title"], match["extract"])
     return f"[위키피디아 - {match['title']}]\n{match['extract'][:1000]}"
 
 
