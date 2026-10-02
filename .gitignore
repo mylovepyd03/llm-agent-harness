@@ -1,5 +1,6 @@
 .env
 __pycache__/
 *.pyc
-data/pubmed_debug_log.jsonl
+# 실행 중 쌓이는 로그(디버그·판단 기록). 코퍼스/임베딩은 .json이라 영향 없음
+data/*.jsonl
 .claude/

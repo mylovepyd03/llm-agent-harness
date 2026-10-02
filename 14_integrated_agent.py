@@ -89,7 +89,49 @@ with open(KDCA_EMBEDDINGS_PATH, encoding="utf-8") as f:
 # 공통: LLM 호출 + 응답 검증(하네스)
 # ---------------------------------------------------------------------------
 
-def chat(messages, model: str = RAG_MODEL, temperature: float = 0, num_predict: int = 512) -> dict:
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
+
+# PubMed 단계(영문 초록 번역 / 종합 / 쉬운말 재설명)에 쓸 모델. 이 세 단계는
+# "영어 의학 논문을 한국어로 옮기고 요약"하는 일이라 로컬 8B 모델이 가장 많이
+# 틀렸던 구간이다(번역 검증 실패로 논문을 통째로 스킵, "아스트마"처럼 음차,
+# 원문에 없는 수치/인과관계 추가). 그래서 이 구간만 Claude로 넘긴다.
+# 되돌리려면 .env에 PUBMED_MODEL=llama3.1.
+PUBMED_MODEL = os.environ.get("PUBMED_MODEL", CLAUDE_MODEL)
+
+_claude_client = None
+_claude_unavailable_reason: str | None = None
+
+
+def _get_claude_client():
+    """Claude 클라이언트(생성용). 쓸 수 없으면 이유를 한 번만 알리고 None.
+    판단 레이어(_get_intent_client)와 따로 두는 이유: 판단 레이어는
+    USE_INTENT_LAYER로 따로 끌 수 있어야 해서 게이트가 다르다."""
+    global _claude_client, _claude_unavailable_reason
+    if _claude_client is not None or _claude_unavailable_reason is not None:
+        return _claude_client
+    try:
+        import anthropic as _anthropic
+    except ImportError:
+        _claude_unavailable_reason = "anthropic 패키지 없음 (pip install anthropic)"
+    else:
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            _claude_unavailable_reason = ".env에 ANTHROPIC_API_KEY 없음"
+    if _claude_unavailable_reason:
+        print(f"  [Claude] 사용 불가: {_claude_unavailable_reason} -> Ollama로 대체")
+        return None
+    # accept-encoding을 gzip으로 고정하는 이유는 _get_intent_client() 주석 참고
+    # (SDK 내부 httpx2의 brotli 해제가 이 환경의 brotli 바인딩과 안 맞음)
+    _claude_client = _anthropic.Anthropic(
+        timeout=120, max_retries=1, default_headers={"accept-encoding": "gzip"},
+    )
+    return _claude_client
+
+
+def _is_claude_model(model: str) -> bool:
+    return model.startswith("claude")
+
+
+def _chat_ollama(messages, model: str, temperature: float, num_predict: int) -> dict:
     payload = {
         "model": model,
         "messages": messages,
@@ -99,6 +141,46 @@ def chat(messages, model: str = RAG_MODEL, temperature: float = 0, num_predict: 
     response = requests.post(OLLAMA_CHAT_URL, json=payload, timeout=180)
     response.raise_for_status()
     return response.json()["message"]
+
+
+def _chat_claude(messages, model: str, num_predict: int) -> dict | None:
+    """Claude로 생성. 메시지 형식이 Ollama와 달라서 맞춰준다(system은 별도 인자,
+    본문은 user/assistant만). 실패하면 None을 돌려줘서 호출자가 Ollama로 넘긴다 -
+    키 만료·요금·네트워크 문제로 전체 기능이 멈추지 않게 하기 위함.
+
+    temperature는 설치된 SDK(1.11.0)가 지원하지 않아 넘기지 않는다(기본값 사용).
+    따라서 call_with_retry의 온도 상향(0 -> 0.6)은 Claude 경로에선 적용되지 않지만,
+    Claude 기본 temperature가 0이 아니라 재시도마다 출력이 달라지므로 재시도 자체는
+    여전히 의미가 있다."""
+    client = _get_claude_client()
+    if client is None:
+        return None
+    system_parts = [m["content"] for m in messages if m.get("role") == "system"]
+    convo = [{"role": m["role"], "content": m["content"]}
+             for m in messages if m.get("role") in ("user", "assistant")]
+    kwargs = {"model": model, "max_tokens": num_predict, "messages": convo}
+    if system_parts:
+        kwargs["system"] = "\n\n".join(system_parts)
+    try:
+        resp = client.messages.create(**kwargs)
+    except Exception as e:
+        print(f"  [Claude] 호출 실패 -> Ollama로 대체: {type(e).__name__}: {e}")
+        return None
+    text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+    return {"role": "assistant", "content": text}
+
+
+def chat(messages, model: str = RAG_MODEL, temperature: float = 0, num_predict: int = 512) -> dict:
+    """모델 이름으로 어디에 물어볼지 정한다 - "claude"로 시작하면 Claude API,
+    그 외에는 로컬 Ollama. 기본값은 지금까지와 같은 llama3.1(RAG_MODEL)이라
+    호출부를 안 바꾸면 동작이 그대로다. Claude가 실패하면 조용히 멈추지 않고
+    Ollama로 대체해서 답을 만든다."""
+    if _is_claude_model(model):
+        message = _chat_claude(messages, model, num_predict)
+        if message is not None:
+            return message
+        model = RAG_MODEL  # 대체: 로컬 모델로 다시 시도
+    return _chat_ollama(messages, model, temperature, num_predict)
 
 
 def has_short_chunk_repetition(content: str) -> bool:
@@ -120,8 +202,19 @@ def has_sentence_repetition(content: str, min_len: int = 15, min_repeats: int = 
 
 
 _ALLOWED_SCRIPT_RANGES = (
-    (0xAC00, 0xD7A3), (0x3131, 0x318E), (0x0000, 0x024F), (0x2000, 0x206F),
+    (0xAC00, 0xD7A3),  # 한글 음절
+    (0x3131, 0x318E),  # 한글 낱자모
+    (0x0000, 0x024F),  # 기본 라틴 + 라틴 확장(알파벳, 숫자, 기호)
+    (0x2000, 0x206F),  # 일반 구두점(—, ·, 따옴표 등)
+    (0x0370, 0x03FF),  # 그리스 문자 - 의학 용어에 정상적으로 쓰임(β세포, α-세포 등)
+    (0x2190, 0x21FF),  # 화살표(→)
+    (0x2200, 0x22FF),  # 수학 기호(±, ≥, ≤)
 )
+# 그리스 문자를 뒤늦게 허용한 이유(2026-10-02): 이 검증기의 목적은 llama3.2 시절의
+# 한자·키릴 유출 차단이었는데, 화이트리스트가 좁아서 "β세포"(베타세포)처럼 정상적인
+# 의학 번역을 거부하고 있었다. PubMed 번역을 Haiku로 바꾼 뒤 같은 논문을 4번
+# 번역해보니 3번이 β 때문에 반려되어 논문이 통째로 스킵됐다 - 모델 문제가 아니라
+# 우리 검증기의 오탐이었음. 한자·키릴은 여전히 막힌다.
 
 
 def has_unexpected_script(content: str) -> bool:
@@ -375,16 +468,31 @@ def search_wikipedia(query: str) -> str:
 
 
 def _get_disease_items(keyword: str):
+    """HIRA 공식 질병코드 조회. 이건 '있으면 좋은' 보강 정보이므로, 실패하면
+    예외를 올리지 않고 빈 목록으로 조용히 넘어간다.
+
+    왜 이렇게 바꿨나(2026-10-02): 예전엔 raise_for_status()로 예외를 올렸는데,
+    data.go.kr 게이트웨이가 일시적으로 400을 반환한 순간 (1) 그 예외가 턴 전체를
+    "외부 서비스 연결 실패"로 중단시켜서 KDCA로 답할 수 있던 질문까지 못 답했고,
+    (2) requests의 HTTPError 메시지에 ServiceKey가 담긴 전체 URL이 들어가서
+    로그에 키가 노출됐다. 그래서 여기서 막는다(오류 메시지에 URL을 싣지 않는다)."""
     if not DISEASE_API_KEY:
         return []
-    response = requests.get(
-        DISEASE_API_URL,
-        params={"ServiceKey": DISEASE_API_KEY, "pageNo": 1, "numOfRows": 5, "sickType": 1,
-                "medTp": 1, "diseaseType": "SICK_NM", "searchText": keyword},
-        timeout=10,
-    )
-    response.raise_for_status()
-    root = ET.fromstring(response.text)
+    try:
+        response = requests.get(
+            DISEASE_API_URL,
+            params={"ServiceKey": DISEASE_API_KEY, "pageNo": 1, "numOfRows": 5, "sickType": 1,
+                    "medTp": 1, "diseaseType": "SICK_NM", "searchText": keyword},
+            timeout=10,
+        )
+        response.raise_for_status()
+        root = ET.fromstring(response.text)
+    except requests.exceptions.RequestException as e:
+        print(f"    [경고] 공식 질병코드 조회 실패({type(e).__name__}) - 이 정보 없이 계속")
+        return []
+    except ET.ParseError:
+        print("    [경고] 공식 질병코드 응답이 XML이 아님 - 이 정보 없이 계속")
+        return []
     return [
         {"sickNm": item.findtext("sickNm", ""), "sickCd": item.findtext("sickCd", ""),
          "sickEngNm": item.findtext("sickEngNm", "")}
@@ -442,7 +550,9 @@ SYMPTOM_RAG_SYSTEM_PROMPT = (
     "친절하게 설명하세요. 한두 문장으로 짧게 끝내지 마세요.\n"
     "답변 끝에는 진단을 좁히는 데 도움될 후속 질문을 하나 자연스럽게 덧붙이세요 "
     "(예: '~한 증상도 있으신가요?'). 참고자료에 실제로 나오는 증상/요인에 대해서만 "
-    "물어보세요."
+    "물어보세요.\n"
+    "출력 형식: 마크다운 기호(**, #, 번호 목록)를 쓰지 말고 평범한 문장으로만 쓰세요 - "
+    "화면이 글자를 그대로 보여주기 때문에 기호가 그대로 노출됩니다."
 )
 
 
@@ -460,7 +570,8 @@ def truncate_at_sentence(text: str, max_chars: int) -> str:
 
 
 def search_symptom_info(symptom_or_keyword: str, question_text: str | None = None,
-                        min_similarity: float | None = None) -> str:
+                        min_similarity: float | None = None,
+                        model: str | None = None) -> str:
     """증상 문장이나 병명을 자유롭게 받아서, 관련 질환을 의미 기반으로 찾아 답한다.
     search_text(=symptom_or_keyword)는 검색(임베딩 매칭) 전용이고, question_text는
     LLM에게 보여줄 [질문] 부분 전용이다 - 분리하는 이유는 아래 참고.
@@ -468,9 +579,15 @@ def search_symptom_info(symptom_or_keyword: str, question_text: str | None = Non
     min_similarity를 따로 넘길 수 있게 둔 이유: 문진으로 정보를 모으고 검색어를
     정규화한 뒤의 검색은 근거가 더 탄탄해서(실측: 구어체 원문은 '파라티푸스'
     0.52로 엉뚱하게 매칭되지만, 정규화한 '상복부 통증 식후 악화'는 소화불량
-    0.578/복통 0.565로 적절하게 매칭됨) 기본 기준(0.6)보다 조금 낮춰도 안전하다."""
+    0.578/복통 0.565로 적절하게 매칭됨) 기본 기준(0.6)보다 조금 낮춰도 안전하다.
+
+    model을 따로 넘길 수 있게 둔 이유: 문진 경로의 참고자료는 여러 질환 문서가
+    함께 들어가서 길어지는데, 그 길이에서 llama3.1이 실측 200초 넘게 걸리고도
+    반복 루프로 검증을 통과하지 못했다(타임아웃을 300초로 올려도 2회 모두 실패).
+    그래서 문진 경로만 Haiku로 생성한다. 기본값은 그대로 로컬(RAG_MODEL)."""
     question_text = question_text or symptom_or_keyword
     threshold = MIN_SIMILARITY_SYMPTOM if min_similarity is None else min_similarity
+    gen_model = model or RAG_MODEL
 
     results = search_kdca(symptom_or_keyword, top_k=5)
     if not results or results[0][1] < threshold:
@@ -493,10 +610,10 @@ def search_symptom_info(symptom_or_keyword: str, question_text: str | None = Non
         {"role": "system", "content": SYMPTOM_RAG_SYSTEM_PROMPT},
         {"role": "user", "content": f"[참고자료]\n{context}\n\n[질문]\n{question_text}"},
     ]
-    # 종합(합성) 단계는 llama3.2가 약함 - PubMed 때와 같은 이유로 RAG_MODEL(llama3.1) 사용.
     # num_predict: 친절하고 상세하게 답하도록 프롬프트를 늘렸더니 512토큰 한도에
     # 걸려 문장이 뚝 끊기는 경우가 실제로 발생해서 넉넉하게 늘림.
-    message = call_with_retry(messages, model=RAG_MODEL, num_predict=1024)
+    # gen_model: 기본은 로컬(llama3.1), 문진 경로만 호출부에서 Haiku를 넘긴다.
+    message = call_with_retry(messages, model=gen_model, num_predict=1024)
     if message is None:
         return "[오류] 모델이 계속 비정상적인 응답을 내서 포기했습니다."
     return message["content"]
@@ -738,7 +855,10 @@ PUBMED_TRANSLATE_SYSTEM_PROMPT = (
     "당신은 의학 논문 초록을 한국어로 옮기는 번역 도우미입니다.\n"
     "아래 영어 초록에 있는 사실만 한국어로 정리하세요.\n"
     "원문에 없는 내용을 추가하거나, 추측하거나, 다른 지식을 끌어오지 마세요.\n"
-    "3~5문장으로 간결하게 쓰세요."
+    "3~5문장으로 간결하게 쓰세요.\n"
+    "출력 형식: \"[번역]\", \"(쉬운 설명)\" 같은 라벨이나 머리말을 붙이지 말고 "
+    "본문만 쓰세요. 마크다운 기호(#, *, **)도 쓰지 마세요 - 소제목이 필요하면 "
+    "\"소제목:\" 형태로 쓰고, 문단은 빈 줄로 나누세요."
 )
 PUBMED_SYNTHESIZE_SYSTEM_PROMPT = (
     "당신은 여러 논문 요약을 종합해서 답하는 의학 연구 요약 도우미입니다.\n"
@@ -747,7 +867,10 @@ PUBMED_SYNTHESIZE_SYSTEM_PROMPT = (
     "[참고 요약]에 실제로 주어진 논문 제목 외의 다른 논문/저자/출판연도를 "
     "새로 만들어서 인용하지 마세요 - 오직 주어진 제목만 언급하세요.\n"
     "이것은 진단이 아니라 연구 요약이므로 단정적으로 말하지 마세요.\n"
-    "질문 문장을 그대로 되풀이하지 말고, 바로 본론(답)부터 말하세요."
+    "질문 문장을 그대로 되풀이하지 말고, 바로 본론(답)부터 말하세요.\n"
+    "출력 형식: \"[번역]\", \"(쉬운 설명)\" 같은 라벨이나 머리말을 붙이지 말고 "
+    "본문만 쓰세요. 마크다운 기호(#, *, **)도 쓰지 마세요 - 소제목이 필요하면 "
+    "\"소제목:\" 형태로 쓰고, 문단은 빈 줄로 나누세요."
 )
 PUBMED_SIMPLIFY_SYSTEM_PROMPT = (
     "당신은 의학 연구 요약을 일반인이 이해하기 쉽게 다시 설명하는 도우미입니다.\n"
@@ -756,7 +879,10 @@ PUBMED_SIMPLIFY_SYSTEM_PROMPT = (
     "어려운 의학 용어나 줄임말이 나오면 쉬운 말로 풀어 쓰거나, 용어 뒤에 괄호로 "
     "짧은 설명을 덧붙이세요 (예: '기관지 과민성(기관지가 자극에 예민하게 반응하는 상태)').\n"
     "원문에 있는 문장/정보량을 크게 늘리거나 줄이지 말고, 있는 내용을 더 쉬운 말로 "
-    "바꾸는 데만 집중하세요."
+    "바꾸는 데만 집중하세요.\n"
+    "출력 형식: \"[번역]\", \"(쉬운 설명)\" 같은 라벨이나 머리말을 붙이지 말고 "
+    "본문만 쓰세요. 마크다운 기호(#, *, **)도 쓰지 마세요 - 소제목이 필요하면 "
+    "\"소제목:\" 형태로 쓰고, 문단은 빈 줄로 나누세요."
 )
 
 
@@ -793,7 +919,7 @@ def _simplify_for_layperson(content: str, valid_years: set[str], keyword: str = 
         {"role": "user", "content": f"[원문]\n{content}"},
     ]
     for attempt in range(2):
-        message = call_with_retry(messages, model=RAG_MODEL, num_predict=1024)
+        message = call_with_retry(messages, model=PUBMED_MODEL, num_predict=1024)
         if message is None:
             print("    [경고] 쉬운 설명 생성 실패 - 원문 그대로 사용")
             return content
@@ -815,7 +941,7 @@ def _translate_abstract(article: dict) -> str | None:
         {"role": "system", "content": PUBMED_TRANSLATE_SYSTEM_PROMPT},
         {"role": "user", "content": f"제목: {article['title']}\n초록: {article['abstract'][:1500]}"},
     ]
-    message = call_with_retry(messages, model=RAG_MODEL)
+    message = call_with_retry(messages, model=PUBMED_MODEL)
     return message["content"] if message else None
 
 
@@ -861,7 +987,7 @@ def search_pubmed_deep(keyword: str) -> str:
         {"role": "user", "content": f"[참고 요약]\n{context}\n\n[질문]\n{keyword}에 대한 최신 연구 결과를 알려줘."},
     ]
     for attempt in range(2):
-        message = call_with_retry(messages, model=RAG_MODEL, num_predict=1024)
+        message = call_with_retry(messages, model=PUBMED_MODEL, num_predict=1024)
         if message is None:
             return "[오류] 모델이 계속 비정상적인 응답을 내서 포기했습니다."
         _log_pubmed_stage(f"synthesize_attempt_{attempt + 1}", keyword, message["content"])
@@ -1103,8 +1229,48 @@ CLARIFY_SYSTEM_PROMPT = (
     "2가지 이내로 구체적으로 물어보세요(그 증상에 실제로 맞는 질문이어야 합니다 - "
     "예: 언제부터인지, 어떤 느낌/정도인지, 같이 나타나는 다른 증상, 식사·수면·"
     "활동과의 관계 등).\n"
-    "전체 3문장 이내로 짧고 따뜻하게 답하세요."
+    "전체 3문장 이내로 짧고 따뜻하게 답하세요.\n"
+    "출력 형식: 마크다운 기호(**, #, 1. 같은 번호 목록)를 쓰지 말고, 평범한 문장으로만 "
+    "쓰세요 - 화면이 글자를 그대로 보여주기 때문에 기호가 그대로 노출됩니다."
 )
+
+
+INTERVIEW_MODEL = os.environ.get("INTERVIEW_MODEL", CLAUDE_MODEL)
+# 문진 경로 생성(추가 질문 + 자료 기반 설명)에 쓸 모델(기본 Haiku). 두 가지 이유:
+#  1) 질문 생성: llama3.1은 "~물어보겠습니다" 같은 어색한 문장을 만들거나 이미
+#     물어본 걸 또 묻는 경우가 있었다.
+#  2) 자료 기반 설명: 문진 경로는 여러 질환 문서가 참고자료로 함께 들어가 길어지는데,
+#     그 길이에서 llama3.1이 실측 207초/204초가 걸리고도 두 번 다 반복 루프로 검증을
+#     통과하지 못했다(타임아웃을 300초로 올려도 실패) - 즉 시간 문제가 아니라 품질
+#     문제였다.
+# 되돌리려면 .env에 INTERVIEW_MODEL=llama3.1.
+
+MIN_SIMILARITY_CANDIDATE = 0.45
+# "가능성" 안내로 이름만 보여줄 최소 유사도. 문진 임계값(0.55)에 못 미쳐도 이 정도면
+# 참고로 언급할 가치가 있다고 보고, 이보다 낮으면 아예 언급하지 않는다(엉뚱한 질환을
+# 가능성이라고 들이대지 않기 위함).
+
+
+def _interview_heard_text(state: MedicalConversationState) -> str:
+    """지금까지 들은 증상을 정리한 텍스트. LLM을 쓰지 않고 state에서 그대로 만든다
+    (사용자가 한 말을 바꾸지 않고 보여주는 게 목적이라 생성이 끼어들 이유가 없다)."""
+    lines = [state.pending_complaint or ""] + list(state.followup_answers)
+    bullets = "\n".join(f"· {t}" for t in lines if t)
+    return f"지금까지 말씀해주신 내용\n{bullets}"
+
+
+def _candidate_text(results) -> str:
+    """상위 후보를 "가능성"으로 조심스럽게 안내하는 문구. 유사도 기준 미만이라
+    확정 답을 못 줄 때도 빈손으로 되묻지 않기 위해 쓴다. 이름만 나열하고 설명은
+    붙이지 않는다(자료를 안 읽고 설명하면 지어내게 되므로)."""
+    names = [n for n, s, _ in results if s >= MIN_SIMILARITY_CANDIDATE]
+    if not names:
+        return ""
+    return (
+        f"말씀해주신 내용과 결이 비슷한 자료로는 {', '.join(names[:3])} 등이 있어요. "
+        "다만 아직 말씀해주신 정보만으로는 어떤 것인지 가리기 어려워서, 가능성으로만 "
+        "참고해주세요."
+    )
 
 
 def ask_for_more_detail(complaint: str, answers: list[str] | None = None) -> str:
@@ -1116,7 +1282,7 @@ def ask_for_more_detail(complaint: str, answers: list[str] | None = None) -> str
         {"role": "system", "content": CLARIFY_SYSTEM_PROMPT},
         {"role": "user", "content": f"[증상 호소]\n{complaint}\n\n[지금까지 들은 내용]\n{heard}"},
     ]
-    message = call_with_retry(messages, model=RAG_MODEL, num_predict=400)
+    message = call_with_retry(messages, model=INTERVIEW_MODEL, num_predict=400)
     if message is None:
         return (
             "증상을 조금 더 자세히 알려주시면 관련 정보를 찾아드릴 수 있어요. "
@@ -1248,41 +1414,62 @@ def _handle_interview_answer(messages: list, user_question: str,
 
     normalized = normalize_symptom_query(description)
     print(f"  [문진] 검색어 정규화: {normalized}")
-    rag_result = search_symptom_info(normalized, description,
-                                     min_similarity=MIN_SIMILARITY_INTERVIEW)
 
-    if not _is_failure_message(rag_result):
-        print("  [문진] 모인 정보로 건강포털 RAG 성공 -> 문진 종료")
-        answer = (
-            f"말씀해주신 내용({description})을 종합해보면 이런 가능성을 참고해보실 "
-            f"수 있어요.\n\n{rag_result}"
-        )
-        state.record_symptom(description, "문진 완료(증상 종합)")
-        top_match = search_kdca(normalized, top_k=1)
-        if top_match:
-            state.record_disease(top_match[0][0], "search_symptom_info(문진 종합 추정)")
-            state.last_topic = top_match[0][0]
-        state.end_interview()
-        state.awaiting_followup_reply = "?" in answer[-200:]
-        messages.append({"role": "assistant", "content": answer})
-        return answer
+    # 검색은 먼저 '점수만' 본다. 생성(LLM)은 비싸고 느려서(실제로 llama3.1 생성이
+    # 180초 타임아웃 나서 답을 아예 못 준 사례가 있었음) 점수를 보고 어떤 답을
+    # 만들지 정한 뒤에 필요한 만큼만 호출한다.
+    results = search_kdca(normalized, top_k=3)
+    top_score = results[0][1] if results else 0.0
+    print("  [문진] 후보:", ", ".join(f"{n}({s:.2f})" for n, s, _ in results) or "없음")
 
+    heard = _interview_heard_text(state)          # 1) 지금까지 들은 증상 정리
+    candidates = _candidate_text(results)         # 2) 기준 미만이어도 "가능성" 안내
+
+    if top_score >= MIN_SIMILARITY_INTERVIEW:
+        # 근거가 충분하면 자료 기반 설명까지 만든다. 생성이 실패하거나 시간이
+        # 초과돼도(아래 except) 정리+가능성+질문은 반드시 돌려준다.
+        try:
+            rag_result = search_symptom_info(normalized, description,
+                                             min_similarity=MIN_SIMILARITY_INTERVIEW,
+                                             model=INTERVIEW_MODEL)
+        except requests.exceptions.RequestException as e:
+            print(f"  [문진] 자료 기반 설명 생성 실패({type(e).__name__}) -> 정리+가능성으로 대체")
+            rag_result = "[오류] 생성 실패"
+        if not _is_failure_message(rag_result):
+            print("  [문진] 모인 정보로 건강포털 RAG 성공 -> 문진 종료")
+            answer = f"{heard}\n\n이 내용을 종합하면 아래 자료를 참고해보실 수 있어요.\n\n{rag_result}"
+            state.record_symptom(description, "문진 완료(증상 종합)")
+            state.record_disease(results[0][0], "search_symptom_info(문진 종합 추정)")
+            state.last_topic = results[0][0]
+            state.end_interview()
+            state.awaiting_followup_reply = "?" in answer[-200:]
+            messages.append({"role": "assistant", "content": answer})
+            return answer
+
+    # 여기까지 왔으면 "확정 답은 못 주는" 상황이다. 예전에는 이럴 때 빈손으로
+    # 되묻기만 했는데, 이제는 들은 내용 정리 + 가능성 후보를 먼저 전하고 필요한
+    # 질문만 덧붙인다.
     if rounds < MAX_INTERVIEW_ROUNDS:
-        print("  [문진] 아직 정보가 부족 -> 추가 질문")
-        combined = ask_for_more_detail(state.pending_complaint or description,
+        print("  [문진] 확정은 어려움 -> 정리 + 가능성 + 추가 질문")
+        question = ask_for_more_detail(state.pending_complaint or description,
                                        state.followup_answers)
+        parts = [heard] + ([candidates] if candidates else []) + [question]
+        combined = "\n\n".join(parts)
         state.awaiting_followup_reply = True
         messages.append({"role": "assistant", "content": combined})
         return combined
 
-    print("  [문진] 충분히 물어봤지만 매칭 실패 -> 솔직하게 마무리")
-    combined = (
-        f"지금까지 말씀해주신 내용({description})만으로는 제가 가진 자료에서 "
-        "어떤 질환인지 좁히기 어려웠어요. 증상이 계속되거나 심해지면 "
-        "가까운 병원에서 진료를 받아보시는 게 좋겠습니다. "
-        "혹시 짐작되는 병명이 있으시면 그 이름으로 다시 물어봐주셔도 돼요."
+    print("  [문진] 충분히 물어봤지만 확정 실패 -> 가능성 안내하고 마무리")
+    closing = (
+        "지금 정보로는 어떤 질환인지 확실히 좁히기는 어려웠어요. 증상이 계속되거나 "
+        "심해지면 가까운 병원에서 진료를 받아보시는 게 좋겠습니다. 짐작되는 병명이 "
+        "있으시면 그 이름으로 다시 물어봐주셔도 돼요."
     )
+    parts = [heard] + ([candidates] if candidates else []) + [closing]
+    combined = "\n\n".join(parts)
     state.record_symptom(description, "문진 종합(질환 특정 실패)")
+    if results and top_score >= MIN_SIMILARITY_CANDIDATE:
+        state.record_disease(results[0][0], "문진 후보(확정 아님)")
     state.end_interview()
     state.awaiting_followup_reply = False
     messages.append({"role": "assistant", "content": combined})

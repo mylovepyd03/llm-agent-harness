@@ -12,10 +12,15 @@ import time
 import xml.etree.ElementTree as ET
 
 import requests
+from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 
+load_dotenv()
+
 KDCA_HEALTH_INFO_URL = "https://api.kdca.go.kr/api/provide/healthInfo"
-KDCA_TOKEN = "1a0a4b2b8e71"
+# 토큰은 .env에서 읽는다. 예전엔 이 자리에 토큰 문자열이 그대로 박혀 있었고,
+# 그 상태로 커밋돼 공개 저장소에 노출됐다(2026-10-02 발견) - 그래서 환경변수로 옮김.
+KDCA_TOKEN = os.environ.get("KDCA_HEALTH_INFO_TOKEN")
 INDEX_PATH = os.path.join(os.path.dirname(__file__), "data", "kdca_disease_index.json")
 CORPUS_PATH = os.path.join(os.path.dirname(__file__), "data", "kdca_corpus.json")
 
@@ -56,6 +61,8 @@ def fetch_one(name: str, sn: int) -> dict | None:
 
 
 if __name__ == "__main__":
+    if not KDCA_TOKEN:
+        raise SystemExit(".env에 KDCA_HEALTH_INFO_TOKEN을 설정해주세요.")
     with open(INDEX_PATH, encoding="utf-8") as f:
         disease_index: dict = json.load(f)
 
